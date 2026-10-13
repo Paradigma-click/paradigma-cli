@@ -4,7 +4,7 @@
   "description": "SEO and AI search monitoring that your agent sets up and runs from your repository.",
   "author": { "name": "Paradigma", "url": "https://paradigma.click" },
   "homepage": "https://paradigma.click",
-  "repository": "https://github.com/alifoo/paradigma-cli",
+  "repository": "https://github.com/Paradigma-click/paradigma-cli",
   "license": "MIT",
   "keywords": [
     "paradigma",

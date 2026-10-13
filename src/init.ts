@@ -167,8 +167,8 @@ export async function initCommand(io: Io, args: string[]) {
       // Device pairing lives behind AUTOPILOT_ENABLED; setup tokens do not.
       if (error instanceof ApiError && error.code === "disabled")
         throw new ActionRequired(
-          `Copy the setup prompt from ${server}/dashboard/onboarding (it includes a one-time token) and run \`npx paradigma-cli init --token …\`.`,
-          { url: `${server}/dashboard/onboarding` },
+          `Copy the setup prompt from ${server}/setup (it includes a one-time token) and run \`npx paradigma-cli init --token …\`.`,
+          { url: `${server}/setup` },
         );
       throw error;
     });

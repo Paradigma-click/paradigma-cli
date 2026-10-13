@@ -19,11 +19,11 @@
   ],
   "homepage": "https://paradigma.click",
   "bugs": {
-    "url": "https://github.com/alifoo/paradigma-cli/issues"
+    "url": "https://github.com/Paradigma-click/paradigma-cli/issues"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/alifoo/paradigma-cli"
+    "url": "https://github.com/Paradigma-click/paradigma-cli"
   },
   "license": "MIT",
   "author": "Paradigma <support@paradigma.click>",

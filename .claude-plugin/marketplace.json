@@ -4,7 +4,7 @@
   "metadata": {
     "description": "Official Paradigma CLI and skills for AI agents: set up and run SEO, GEO and agent visibility monitoring from your repository.",
     "version": "0.2.0",
-    "repository": "https://github.com/alifoo/paradigma-cli"
+    "repository": "https://github.com/Paradigma-click/paradigma-cli"
   },
   "plugins": [
     {

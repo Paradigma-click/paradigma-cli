@@ -12,7 +12,7 @@ Paradigma watches a Next.js site from its GitHub repository: crawl audits, Searc
 
 ## Keeping this skill updated
 
-**Source**: [github.com/alifoo/paradigma-cli](https://github.com/alifoo/paradigma-cli)
+**Source**: [github.com/Paradigma-click/paradigma-cli](https://github.com/Paradigma-click/paradigma-cli)
 
 | Installation | How to update |
 | --- | --- |

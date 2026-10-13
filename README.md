@@ -71,14 +71,14 @@ This repository also ships the Paradigma skill and plugin manifests, so your age
 Claude Code:
 
 ```
-/plugin marketplace add alifoo/paradigma-cli
+/plugin marketplace add Paradigma-click/paradigma-cli
 /plugin install paradigma@paradigma-cli
 /reload-plugins
 ```
 
 Then authorize the Paradigma MCP server when prompted (`/plugin` → Installed → Paradigma).
 
-Cursor, Codex CLI and others: `npx skills add alifoo/paradigma-cli`, or add `https://paradigma.click/api/mcp` as a remote MCP connector (`npx paradigma-cli mcp install --agent claude|codex|cursor` does this for you) and copy `skills/paradigma/` into your skills directory.
+Cursor, Codex CLI and others: `npx skills add Paradigma-click/paradigma-cli`, or add `https://paradigma.click/api/mcp` as a remote MCP connector (`npx paradigma-cli mcp install --agent claude|codex|cursor` does this for you) and copy `skills/paradigma/` into your skills directory.
 
 Then ask your agent:
 
