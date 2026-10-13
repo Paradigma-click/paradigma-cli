@@ -1,0 +1,18 @@
+{
+  "name": "paradigma-cli",
+  "owner": { "name": "Paradigma", "url": "https://paradigma.click" },
+  "metadata": {
+    "description": "Official Paradigma CLI and skills for AI agents: set up and run SEO, GEO and agent visibility monitoring from your repository.",
+    "version": "0.2.0",
+    "repository": "https://github.com/alifoo/paradigma-cli"
+  },
+  "plugins": [
+    {
+      "name": "paradigma",
+      "source": "./skills/paradigma",
+      "description": "Set up Paradigma in a repository, check how the site does in Google and AI answers, fix findings, run audits, syncs and GEO samples, and manage Autopilot.",
+      "strict": false,
+      "skills": ["./"]
+    }
+  ]
+}

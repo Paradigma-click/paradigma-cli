@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "paradigma": { "type": "http", "url": "https://paradigma.click/api/mcp" }
+  }
+}

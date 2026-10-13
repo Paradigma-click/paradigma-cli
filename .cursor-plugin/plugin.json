@@ -1,0 +1,24 @@
+{
+  "name": "paradigma",
+  "displayName": "Paradigma",
+  "description": "SEO and AI search monitoring that your agent sets up and runs from your repository.",
+  "version": "0.2.0",
+  "author": { "name": "Paradigma" },
+  "publisher": "Paradigma",
+  "homepage": "https://paradigma.click",
+  "repository": "https://github.com/alifoo/paradigma-cli",
+  "license": "MIT",
+  "keywords": [
+    "paradigma",
+    "seo",
+    "geo",
+    "ai-search",
+    "nextjs",
+    "mcp",
+    "skills"
+  ],
+  "category": "developer-tools",
+  "tags": ["mcp", "skills", "seo"],
+  "skills": "./skills/",
+  "mcpServers": "./skills/paradigma/.mcp.json"
+}
