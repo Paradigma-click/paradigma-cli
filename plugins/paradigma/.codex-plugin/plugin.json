@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Paradigma",
     "shortDescription": "SEO and AI search monitoring from your repo.",
-    "longDescription": "Paradigma watches how your Next.js site shows up in Google and in AI answers, straight from its GitHub repository: audits, Search Console and analytics syncs, AI answer sampling on your own keys, findings with reviewable fix PRs, and Autopilot. The plugin bundles the Paradigma skill and the hosted MCP server configuration; setup runs through the open-source paradigma CLI.",
+    "longDescription": "Paradigma watches how your site shows up in Google and in AI answers, straight from its GitHub repository: audits, Search Console and analytics syncs, AI answer sampling on your own keys, findings with reviewable fix PRs, and Autopilot. The plugin bundles the Paradigma skill and the hosted MCP server configuration; setup runs through the open-source paradigma CLI.",
     "developerName": "Paradigma",
     "category": "Productivity",
     "capabilities": ["Interactive", "Write"],
@@ -30,6 +30,6 @@
       "How is my site doing in Google and AI answers?",
       "Fix the top SEO issue"
     ],
-    "brandColor": "#111114"
+    "brandColor": "#11151f"
   }
 }

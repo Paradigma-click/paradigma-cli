@@ -1,7 +1,7 @@
 {
   "name": "paradigma-cli",
-  "version": "0.2.0",
-  "description": "Paradigma CLI: lets your coding agent set up and operate Paradigma SEO/GEO monitoring, and runs Autopilot locally with your own agent and git credentials.",
+  "version": "0.12.0",
+  "description": "Paradigma CLI: lets your coding agent set up and operate Paradigma SEO/GEO monitoring, and runs Paradigma fixes in your own GitHub Actions.",
   "keywords": [
     "paradigma",
     "seo",

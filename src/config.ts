@@ -4,33 +4,19 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 
-export const AGENT_NAMES = ["claude", "codex", "cursor", "custom"] as const;
-export type AgentName = (typeof AGENT_NAMES)[number];
-
 export const DEFAULT_SERVER = "https://paradigma.click";
 
-const configSchema = z.object({
+/**
+ * The CLI's settings. Loose on purpose: keys this version does not know are kept as they are when
+ * it saves, so older and newer versions can share the file.
+ */
+export const configSchema = z.looseObject({
   server: z.string().default(DEFAULT_SERVER),
+  /** Id of the CLI credential (from `init` or device pairing). */
   runnerId: z.string().optional(),
   token: z.string().optional(),
-  /** Ed25519 key (base64url) pinned at pairing; every task must verify. */
+  /** Ed25519 key (base64url) pinned at sign-in. */
   publicKey: z.string().optional(),
-  /** Server repository id → absolute local clone path. */
-  repos: z.record(z.string(), z.string()).default({}),
-  /** Display names for mapped repositories (owner/name), for status output. */
-  repoNames: z.record(z.string(), z.string()).default({}),
-  agent: z.enum(AGENT_NAMES).optional(),
-  /** Per repository id: shell commands that replace detected checks. */
-  checks: z.record(z.string(), z.array(z.string())).default({}),
-  paused: z.boolean().default(false),
-  schedule: z
-    .object({
-      hour: z.number().int().min(0).max(23),
-      minute: z.number().int().min(0).max(59),
-    })
-    .optional(),
-  lastRunAt: z.string().optional(),
-  lastSuccessAt: z.string().optional(),
   /** Project chosen by `init`, used when a command gets no --project. */
   defaultProjectId: z.string().optional(),
 });
@@ -57,19 +43,24 @@ export function configPath() {
   return homePath("config.json");
 }
 
-export function loadConfig(): Config {
+/** Reads the config file with `schema` (defaults when the file does not exist). */
+export function readConfigFile<T>(schema: z.ZodType<T>): T {
   const file = configPath();
-  if (!existsSync(file)) return configSchema.parse({});
+  if (!existsSync(file)) return schema.parse({});
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(file, "utf8"));
   } catch {
     throw new Error(`${file} is not valid JSON. Fix or delete it.`);
   }
-  const parsed = configSchema.safeParse(raw);
+  const parsed = schema.safeParse(raw);
   if (!parsed.success)
     throw new Error(`${file} has an invalid shape. Fix or delete it.`);
   return parsed.data;
+}
+
+export function loadConfig(): Config {
+  return readConfigFile(configSchema);
 }
 
 /** Writes atomically with mode 0600; the home directory is kept at 0700. */
@@ -92,27 +83,11 @@ export async function updateConfig(change: (config: Config) => void) {
   return config;
 }
 
-export type PairedConfig = Config & {
-  runnerId: string;
-  token: string;
-  publicKey: string;
-};
-
-export function isPaired(config: Config): config is PairedConfig {
-  return Boolean(config.runnerId && config.token && config.publicKey);
-}
-
 /** Platform commands need only the CLI credential (no pinned key). */
-export function requireToken(config: Config): Config & { token: string } {
+export function requireToken<C extends Config>(
+  config: C,
+): C & { token: string } {
   if (!config.token)
-    throw new Error(
-      "Not signed in. Run `npx paradigma-cli init` (or `paradigma setup`) first.",
-    );
-  return config as Config & { token: string };
-}
-
-export function requirePaired(config: Config): PairedConfig {
-  if (!isPaired(config))
-    throw new Error("This machine is not paired. Run `paradigma setup` first.");
-  return config;
+    throw new Error("Not signed in. Run `npx paradigma-cli init` first.");
+  return config as C & { token: string };
 }

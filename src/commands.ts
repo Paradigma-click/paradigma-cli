@@ -1,7 +1,12 @@
 import { randomBytes } from "node:crypto";
 import { parseArgs } from "node:util";
 import { type Config, loadConfig, requireToken } from "./config";
+import { runConnectAi } from "./connect-ai";
+import { BING_VERIFYING_LINE, runConnectBing } from "./connect-bing";
 import {
+  type CliGoogleSetup,
+  type CliIndexCoverage,
+  type CliIndexNowStatus,
   type CliProject,
   type CliVerificationMethod,
   CREDENTIAL_PROVIDERS,
@@ -45,9 +50,14 @@ export function clientFor(config: Config, io: Io) {
   });
 }
 
-type Ctx = { io: Io; out: Reporter; config: Config; client: PlatformClient };
+export type Ctx = {
+  io: Io;
+  out: Reporter;
+  config: Config;
+  client: PlatformClient;
+};
 
-function context(io: Io, json: boolean): Ctx {
+export function context(io: Io, json: boolean): Ctx {
   const config = requireToken(loadConfig());
   return {
     io,
@@ -199,6 +209,7 @@ async function linksCommand(io: Io, args: string[]) {
     show("MCP server", links.mcpUrl);
     for (const project of (links.projects as Loose[] | undefined) ?? []) {
       ctx.out.line(`Project ${project.projectId}:`);
+      show("  Set up Google", project.setUpGoogleUrl);
       show("  Search Console", project.connectSearchConsoleUrl);
       show("  Google Analytics", project.connectGa4Url);
       show("  Settings", project.settingsUrl);
@@ -445,7 +456,60 @@ async function readSecret(io: Io, label: string, envName: string | undefined) {
   throw new UsageError(`Pipe the ${label} on stdin or pass --key-env NAME.`);
 }
 
+/** `paradigma connect ai [--project ID | --all] [--yes]` (see connect-ai.ts). */
+async function connectAiCommand(io: Io, args: string[]) {
+  const { values } = parseArgs({
+    args,
+    options: {
+      json: { type: "boolean" },
+      project: { type: "string" },
+      all: { type: "boolean" },
+      yes: { type: "boolean" },
+      own: { type: "boolean" },
+    },
+    allowPositionals: true,
+    strict: true,
+  });
+  if (values.all && values.project)
+    throw new UsageError("Pass --project ID or --all, not both.");
+  const ctx = context(io, Boolean(values.json));
+  const { projects } = await ctx.client.projects();
+  const usable = projects.filter((project) => project.verified === true);
+  let anchor: CliProject | { id: string; orgId: null; repoId: null };
+  if (values.all) {
+    if (!usable.length)
+      throw new ActionRequired(
+        "No verified projects yet. Run `npx paradigma-cli init` in your repository.",
+      );
+    anchor = await resolveProject(ctx, undefined).catch(() => usable[0]);
+  } else anchor = await resolveProject(ctx, values.project);
+  const scope = values.all ? "all" : values.project ? "project" : "workspace";
+  const targets =
+    scope === "all"
+      ? usable
+      : scope === "project"
+        ? [anchor]
+        : [
+            anchor,
+            ...usable.filter(
+              (project) =>
+                project.orgId === anchor.orgId && project.id !== anchor.id,
+            ),
+          ];
+  await runConnectAi({
+    io,
+    out: ctx.out,
+    client: ctx.client,
+    anchor,
+    targets,
+    scope,
+    yes: Boolean(values.yes),
+    own: Boolean(values.own),
+  });
+}
+
 async function connectCommand(io: Io, args: string[]) {
+  if (args[0] === "ai") return connectAiCommand(io, args.slice(1));
   if (args.some((arg) => SECRET_FLAG.test(arg)))
     throw new UsageError(
       "Secrets are never accepted as arguments. Pipe the key on stdin (paradigma connect <provider> < key.txt) or pass --key-env NAME.",
@@ -472,11 +536,32 @@ async function connectCommand(io: Io, args: string[]) {
     !(CREDENTIAL_PROVIDERS as readonly string[]).includes(provider)
   )
     throw new UsageError(
-      `Usage: paradigma connect ${CREDENTIAL_PROVIDERS.join("|")}`,
+      `Usage: paradigma connect ai|${CREDENTIAL_PROVIDERS.join("|")}`,
     );
   let request: CredentialRequest;
   const envName = values["key-env"];
-  if (provider === "dataforseo") {
+  if (provider === "bing" && !envName) {
+    // A piped key keeps working; otherwise "Connect Bing" with Microsoft.
+    const piped = io.stdinIsTTY ? "" : (await io.readStdin()).trim();
+    if (!piped) {
+      const ctx = context(io, Boolean(values.json));
+      const project = await resolveProject(ctx, values.project);
+      if (
+        await runConnectBing({
+          io,
+          out: ctx.out,
+          client: ctx.client,
+          projectId: project.id,
+        })
+      )
+        return;
+      ctx.out.line("Connect Bing is not available here: use an API key.");
+    }
+    request = {
+      provider,
+      apiKey: piped || (await readSecret(io, "bing API key", envName)),
+    };
+  } else if (provider === "dataforseo") {
     const location = Number(values.location ?? "2840");
     if (!values.login)
       throw new UsageError(
@@ -527,6 +612,10 @@ async function connectCommand(io: Io, args: string[]) {
   const ctx = context(io, Boolean(values.json));
   const project = await resolveProject(ctx, values.project);
   const result = await ctx.client.connect(project.id, request);
+  if (result.verifying === true) {
+    ctx.out.result(result, () => ctx.out.line(BING_VERIFYING_LINE));
+    return;
+  }
   ctx.out.result(result, () => {
     ctx.out.line(
       `Connected ${provider} for project ${project.id}. The key is stored encrypted and is never shown again.`,
@@ -550,6 +639,7 @@ async function geoCommand(io: Io, args: string[]) {
       project: { type: "string" },
       engine: { type: "string" },
       daily: { type: "string" },
+      every: { type: "string" },
       off: { type: "boolean" },
       prompt: { type: "string" },
       state: { type: "string" },
@@ -607,6 +697,14 @@ async function geoCommand(io: Io, args: string[]) {
       throw new UsageError(
         `--daily must be one of ${GEO_DAILY_LIMITS.join(", ")}`,
       );
+    const every = values.every === undefined ? undefined : Number(values.every);
+    if (
+      every !== undefined &&
+      (chosen !== "google_ai_mode" || ![1, 7].includes(every))
+    )
+      throw new UsageError(
+        "--every takes 7 or 1 and only applies to google_ai_mode",
+      );
     if (!values.off && !values["accept-charges"])
       throw new UsageError(
         "Automatic sampling uses your provider key and can incur recurring charges (up to --daily calls per day). Re-run with --accept-charges to confirm, or --off to disable.",
@@ -621,6 +719,7 @@ async function geoCommand(io: Io, args: string[]) {
       await ctx.client.geoSchedule(project.id, {
         engine: chosen,
         dailyLimit: daily,
+        ...(every !== undefined ? { intervalDays: every as 1 | 7 } : {}),
         enabled: !values.off,
         acceptCharges: Boolean(values["accept-charges"]),
         idempotencyKey: newIdempotencyKey(),
@@ -725,12 +824,57 @@ async function billingCommand(io: Io, args: string[]) {
   if (values.open) io.openUrl(result.url);
 }
 
+const LEVEL_NAMES = ["Full autopilot", "Autopilot", "Open PR", "Notify"];
+const FULL_AUTOPILOT_CONFIRM =
+  "Level 0 (Full autopilot) merges without human review. Re-run with --confirm-full-autopilot to confirm (allowlisted accounts only).";
+const AUTOPILOT_USAGE =
+  "Usage: paradigma autopilot level 0|1|2|3 | default 0|1|2|3|off | follow-default | pause | resume [--repo owner/name]";
+
+/** The workspace for `autopilot default`: --org, else the repository's. */
+async function resolveAutopilotOrg(
+  ctx: Ctx,
+  flags: { org?: string; repo?: string },
+) {
+  if (flags.org) {
+    if (!UUID.test(flags.org))
+      throw new UsageError("--org must be an organization id (UUID).");
+    return flags.org;
+  }
+  const { repositories } = await ctx.client.targets();
+  const byName = (name: string) =>
+    repositories.find(
+      (r) =>
+        r.repoId === name || r.fullName.toLowerCase() === name.toLowerCase(),
+    );
+  if (flags.repo) {
+    const found = byName(flags.repo);
+    if (!found)
+      throw new UsageError(
+        `${flags.repo} is not an installed repository you can write to.`,
+      );
+    return found.orgId;
+  }
+  const detected = await detectRepo(ctx.io.cwd);
+  const local = detected ? byName(detected.fullName) : undefined;
+  if (local) return local.orgId;
+  const orgs = [...new Set(repositories.map((r) => r.orgId))];
+  if (orgs.length === 1 && orgs[0]) return orgs[0];
+  throw new UsageError("Pass --org <id> or --repo owner/name.");
+}
+
+function levelLabel(level: number | undefined, enabled = true) {
+  if (level === undefined) return "an unknown level";
+  const name = `level ${level} (${LEVEL_NAMES[level] ?? "unknown"})`;
+  return enabled ? name : `off, ${name}`;
+}
+
 async function autopilotCommand(io: Io, args: string[]) {
   const { values, positionals } = parseArgs({
     args,
     options: {
       json: { type: "boolean" },
       repo: { type: "string" },
+      org: { type: "string" },
       project: { type: "string" },
       reason: { type: "string" },
       "confirm-full-autopilot": { type: "boolean" },
@@ -739,32 +883,68 @@ async function autopilotCommand(io: Io, args: string[]) {
     strict: true,
   });
   const [action, raw] = positionals;
-  if (action !== "level" && action !== "pause" && action !== "resume")
-    throw new UsageError(
-      "Usage: paradigma autopilot level 0|1|2|3 | pause | resume [--repo owner/name]",
-    );
+  if (
+    action !== "level" &&
+    action !== "default" &&
+    action !== "follow-default" &&
+    action !== "pause" &&
+    action !== "resume"
+  )
+    throw new UsageError(AUTOPILOT_USAGE);
+  const confirm = Boolean(values["confirm-full-autopilot"]);
   let level: number | undefined;
-  if (action === "level") {
-    level = Number(raw);
+  if (action === "level" || action === "default") {
+    level = action === "default" && raw === "off" ? 3 : Number(raw);
     if (![0, 1, 2, 3].includes(level))
-      throw new UsageError("Level must be 0, 1, 2 or 3.");
-    if (level === 0 && !values["confirm-full-autopilot"])
       throw new UsageError(
-        "Level 0 (Full autopilot) merges without human review. Re-run with --confirm-full-autopilot to confirm (allowlisted accounts only).",
+        action === "default"
+          ? "Default level must be 0, 1, 2, 3 or off."
+          : "Level must be 0, 1, 2 or 3.",
       );
+    if (level === 0 && !confirm) throw new UsageError(FULL_AUTOPILOT_CONFIRM);
   }
   const ctx = context(io, Boolean(values.json));
+  if (action === "default") {
+    const orgId = await resolveAutopilotOrg(ctx, values);
+    const enabled = raw !== "off";
+    const result = await ctx.client.autopilotDefault(orgId, {
+      level: level as 0 | 1 | 2 | 3,
+      enabled,
+      ...(level === 0 ? { confirmFullAutopilot: true } : {}),
+    });
+    ctx.out.result(result, () => {
+      ctx.out.line(
+        `Workspace default set to ${levelLabel(level, enabled)} for organization ${orgId}.`,
+      );
+      ctx.out.line(
+        `${result.updated + result.inserted} repositories follow it (${result.inserted} new). Repositories with their own level keep it: run "paradigma autopilot follow-default --repo owner/name" to switch one back.`,
+      );
+    });
+    return;
+  }
   const repoId = await resolveRepo(ctx, values);
+  const repoName = values.repo ?? repoId;
   if (action === "level") {
     const result = await ctx.client.autopilotPolicy(repoId, {
       enabled: true,
       level,
       ...(level === 0 ? { confirmFullAutopilot: true } : {}),
     });
-    const names = ["Full autopilot", "Autopilot", "Open PR", "Notify"];
     ctx.out.result(result, () =>
       ctx.out.line(
-        `Autopilot on at level ${level} (${names[level as number]}) for repository ${repoId}.`,
+        `Autopilot on at ${levelLabel(level)} for repository ${repoName}${result.workspaceDefault ? " (overrides the workspace default)" : ""}.`,
+      ),
+    );
+    return;
+  }
+  if (action === "follow-default") {
+    const result = await ctx.client.autopilotFollowDefault(repoId, confirm);
+    const { policy } = result;
+    ctx.out.result(result, () =>
+      ctx.out.line(
+        result.workspaceDefault
+          ? `${repoName} now follows the workspace default: ${levelLabel(policy.level, policy.enabled)}.`
+          : `No workspace default yet: ${repoName} is back on the built-in default (${levelLabel(policy.level, policy.enabled)}) and will follow a default once one is set.`,
       ),
     );
     return;
@@ -776,7 +956,7 @@ async function autopilotCommand(io: Io, args: string[]) {
   ctx.out.result(result, () =>
     ctx.out.line(
       action === "pause"
-        ? "Autopilot paused on the server for this repository (all runners)."
+        ? "Autopilot paused on the server for this repository."
         : "Autopilot resumed on the server for this repository.",
     ),
   );
@@ -824,8 +1004,376 @@ async function mcpCommand(io: Io, args: string[]) {
   if (result.status === "failed") process.exitCode = 1;
 }
 
+/** Prints "Set up Google for me" progress (docs/19) for a person or an agent. */
+function printGoogleSetup(ctx: Ctx, setup: CliGoogleSetup) {
+  const { searchConsole: gsc, analytics: ga4 } = setup;
+  ctx.out.line(
+    `Search Console    ${gsc.status.replaceAll("_", " ")}${gsc.property ? ` · ${gsc.property}` : ""}`,
+  );
+  if (gsc.file) {
+    ctx.out.line(
+      `  File            ${gsc.file.repoPath} containing ${gsc.file.contents}`,
+    );
+    if (gsc.pullUrl) ctx.out.line(`  Pull request    ${gsc.pullUrl}`);
+    ctx.out.line("  Merge and deploy it, then run: paradigma google check");
+  }
+  ctx.out.line(
+    `Google Analytics  ${ga4.status.replaceAll("_", " ")}${ga4.propertyId ? ` · property ${ga4.propertyId}` : ""}`,
+  );
+  if (ga4.measurementId) ctx.out.line(`  Measurement ID  ${ga4.measurementId}`);
+  for (const account of ga4.accounts)
+    ctx.out.line(
+      `  Account         ${account.id}  ${account.name}   (paradigma google account ${account.id})`,
+    );
+  if (ga4.createAccountUrl)
+    ctx.out.line(
+      `  Create an Analytics account: ${ga4.createAccountUrl}, then run paradigma google again`,
+    );
+  if (ga4.tagInstructions) {
+    ctx.out.line("");
+    ctx.out.line("Add the Analytics tag:");
+    for (const line of ga4.tagInstructions.split("\n"))
+      ctx.out.line(`  ${line}`);
+  }
+  if (setup.lastError) ctx.out.line(`Last error: ${setup.lastError}`);
+}
+
+const GOOGLE_WAIT_MS = 10 * 60_000;
+
+async function googleCommand(io: Io, args: string[]) {
+  const { values, positionals } = parseArgs({
+    args,
+    options: {
+      json: { type: "boolean" },
+      project: { type: "string" },
+      "time-zone": { type: "string" },
+      "no-open": { type: "boolean" },
+      wait: { type: "string" },
+    },
+    allowPositionals: true,
+    strict: true,
+  });
+  const [action = "setup", accountId] = positionals;
+  const ctx = context(io, Boolean(values.json));
+  const project = await resolveProject(ctx, values.project);
+  let setup: CliGoogleSetup;
+  if (action === "check") setup = await ctx.client.checkGoogleSetup(project.id);
+  else if (action === "account") {
+    if (!accountId || !/^[1-9]\d{0,15}$/.test(accountId))
+      throw new UsageError("Usage: paradigma google account <accountId>");
+    setup = await ctx.client.chooseGa4Account(
+      project.id,
+      accountId,
+      values["time-zone"],
+    );
+  } else if (action === "setup") {
+    setup = await ctx.client.googleSetup(project.id);
+    if (!setup.verified)
+      throw new UsageError("Verify the domain first: paradigma verify");
+    if (!setup.started) {
+      const waitMs = values.wait ? Number(values.wait) * 1000 : GOOGLE_WAIT_MS;
+      if (!Number.isFinite(waitMs) || waitMs < 0)
+        throw new UsageError("--wait must be a number of seconds");
+      ctx.out.event("google_consent", { url: setup.startUrl });
+      ctx.out.line(
+        `Open this link and allow access in Google:\n  ${setup.startUrl}`,
+      );
+      if (!values["no-open"] && io.interactive) io.openUrl(setup.startUrl);
+      const deadline = io.now() + waitMs;
+      while (!setup.started && io.now() < deadline) {
+        await io.sleep(5_000);
+        setup = await ctx.client.googleSetup(project.id);
+      }
+      if (!setup.started) {
+        ctx.out.result(setup, () =>
+          ctx.out.line(
+            "Still waiting for Google consent. Run paradigma google again after allowing access.",
+          ),
+        );
+        process.exitCode = 3;
+        return;
+      }
+    }
+  } else
+    throw new UsageError(
+      "Usage: paradigma google [check | account <accountId>]",
+    );
+  ctx.out.result(setup, () => printGoogleSetup(ctx, setup));
+  if (!setup.done) process.exitCode = 3;
+}
+
+const INDEXNOW_STATES: Record<string, string> = {
+  not_started: "not set up (paradigma indexnow setup)",
+  waiting:
+    "waiting for the key file: merge and deploy the pull request; the next production deploy confirms it",
+  active: "on",
+  off: "off (paradigma indexnow on to resume)",
+};
+
+/** Prints IndexNow state (docs/22) and what the last production deploys sent. */
+function printIndexNow(ctx: Ctx, status: CliIndexNowStatus) {
+  ctx.out.line(
+    `IndexNow          ${INDEXNOW_STATES[status.state] ?? status.state}`,
+  );
+  ctx.out.line(
+    "  Engines         Bing, Yandex, Naver, Seznam, Yep (Google does not take part)",
+  );
+  if (status.keyFilePath)
+    ctx.out.line(
+      `  Key file        ${status.keyFilePath}${status.keyFileUrl ? `  (served at ${status.keyFileUrl})` : ""}`,
+    );
+  if (status.pullRequestUrl)
+    ctx.out.line(`  Pull request    ${status.pullRequestUrl}`);
+  if (status.recentDeploys.length) {
+    ctx.out.line("Recent production deploys:");
+    for (const deploy of status.recentDeploys)
+      ctx.out.line(
+        `  ${deploy.submittedAt.slice(0, 16).replace("T", " ")}  ${deploy.outcome.replaceAll("_", " ")}  ${deploy.urlCount} URL${deploy.urlCount === 1 ? "" : "s"}${deploy.httpStatus ? `  (HTTP ${deploy.httpStatus})` : ""}`,
+      );
+  } else if (status.state === "active")
+    ctx.out.line(
+      "  No production deploy since setup. The first one records a baseline; later ones send new and changed pages.",
+    );
+  ctx.out.line(`  Settings        ${status.settingsUrl}`);
+}
+
+async function indexNowCommand(io: Io, args: string[]) {
+  const { values, positionals } = parseArgs({
+    args,
+    options: { json: { type: "boolean" }, project: { type: "string" } },
+    allowPositionals: true,
+    strict: true,
+  });
+  const action = positionals[0] ?? "status";
+  if (!["status", "setup", "on", "off"].includes(action) || positionals[1])
+    throw new UsageError("Usage: paradigma indexnow [status|setup|on|off]");
+  const ctx = context(io, Boolean(values.json));
+  const project = await resolveProject(ctx, values.project);
+  if (action === "status") {
+    const status = await ctx.client.indexNowStatus(project.id);
+    ctx.out.result(status, () => printIndexNow(ctx, status));
+    if (status.state === "not_started" || status.state === "waiting")
+      process.exitCode = 3;
+    return;
+  }
+  if (action === "setup") {
+    const status = await ctx.client.setupIndexNow(project.id);
+    ctx.out.result(status, () => {
+      if (status.result === "conflict") {
+        ctx.out.warn(
+          "A different file already exists where the key file would go. Nothing was changed.",
+        );
+        return;
+      }
+      if (status.result === "verified")
+        ctx.out.line("IndexNow is on: the key file is already served.");
+      else
+        ctx.out.line(
+          "Opened the key file pull request. Merge and deploy it; after that, each production deploy sends its new and changed pages.",
+        );
+      printIndexNow(ctx, status);
+    });
+    process.exitCode =
+      status.result === "conflict" ? 1 : status.result === "verified" ? 0 : 3;
+    return;
+  }
+  const status = await ctx.client.setIndexNowEnabled(
+    project.id,
+    action === "on",
+  );
+  ctx.out.result(status, () => {
+    ctx.out.line(
+      action === "on"
+        ? "IndexNow submissions resumed."
+        : "IndexNow submissions paused. The key file stays in the repository.",
+    );
+    printIndexNow(ctx, status);
+  });
+}
+
+const REASON_ORDER = [
+  "indexed",
+  "discovered_not_indexed",
+  "crawled_not_indexed",
+  "unknown",
+  "noindex",
+  "canonical_elsewhere",
+  "robots_blocked",
+  "soft_404",
+  "not_found",
+  "server_error",
+  "redirect",
+  "other",
+  "not_checked",
+];
+const REASON_LABELS: Record<string, string> = {
+  indexed: "Indexed",
+  discovered_not_indexed: "Discovered, not indexed",
+  crawled_not_indexed: "Crawled, not indexed",
+  unknown: "Unknown to Google",
+  noindex: "Excluded by noindex",
+  canonical_elsewhere: "Canonical elsewhere",
+  robots_blocked: "Blocked by robots.txt",
+  soft_404: "Soft 404",
+  not_found: "Not found",
+  server_error: "Server error",
+  redirect: "Redirect",
+  other: "Other",
+  not_checked: "Not checked yet",
+};
+const OUTCOMES: Record<string, string> = {
+  waiting: "requested, re-checked after 3 and 7 days",
+  indexed_after_request: "indexed after request",
+  not_yet: "requested, not indexed yet",
+};
+
+const day = (iso: string | null) =>
+  iso ? iso.slice(0, 16).replace("T", " ") : "never";
+
+/** Prints index coverage, the reasons, today's pages to request and the sitemap line. */
+function printIndexCoverage(ctx: Ctx, coverage: CliIndexCoverage) {
+  if (!coverage.connected) {
+    ctx.out.line(
+      "Search Console is not connected for this project. Run `paradigma google` first.",
+    );
+    return;
+  }
+  const change =
+    coverage.change && coverage.change !== 0
+      ? ` (${coverage.change > 0 ? "+" : ""}${coverage.change} since yesterday)`
+      : "";
+  ctx.out.line(
+    `Indexed           ${coverage.indexed} of ${coverage.checked} checked pages${change}`,
+  );
+  ctx.out.line(
+    `  Not checked yet ${coverage.notChecked} of ${coverage.candidates} candidates`,
+  );
+  ctx.out.line(
+    `  Last check      ${day(coverage.lastCheckAt)}${coverage.running ? " (checking now)" : ""}  ·  ${coverage.budget.usedToday}/${coverage.budget.daily} inspections today`,
+  );
+  const reasons = REASON_ORDER.filter(
+    (reason) =>
+      reason !== "indexed" &&
+      reason !== "not_checked" &&
+      (coverage.byReason[reason] ?? 0) > 0,
+  );
+  if (reasons.length) {
+    ctx.out.line("Not indexed:");
+    for (const reason of reasons)
+      ctx.out.line(
+        `  ${String(coverage.byReason[reason]).padStart(5)}  ${REASON_LABELS[reason] ?? reason}`,
+      );
+  }
+  const items = coverage.requests.items;
+  if (items.length) {
+    ctx.out.line(
+      `Request indexing today${coverage.requests.day ? ` (${coverage.requests.day})` : ""}: open each link and click "Request indexing" in Search Console`,
+    );
+    for (const item of items) {
+      ctx.out.line(
+        `  ${item.requested ? "[x]" : "[ ]"} ${item.url}  ${item.reasonLabel}${item.outcome ? `, ${OUTCOMES[item.outcome] ?? item.outcome}` : ""}`,
+      );
+      ctx.out.line(`      ${item.inspectUrl}`);
+    }
+    ctx.out.line(
+      "  Then: paradigma index requested <url>...  (an agent with browser access can open the links in your signed-in browser and click the button)",
+    );
+  } else ctx.out.line("Nothing to request today.");
+  if (coverage.wins.length) {
+    ctx.out.line("Indexed after request:");
+    for (const win of coverage.wins.slice(0, 10))
+      ctx.out.line(`  ${win.url}  ${win.indexedAt.slice(0, 10)}`);
+  }
+  const { sitemap } = coverage;
+  const report = sitemap.report[0];
+  ctx.out.line(
+    `Sitemap           ${
+      sitemap.read === false
+        ? "not found"
+        : sitemap.submittedAt
+          ? `submitted ${day(sitemap.submittedAt)}`
+          : sitemap.canSubmit
+            ? "not submitted yet"
+            : "resubmission off (read-only Google access)"
+    }${report ? `  ·  read by Google ${day(report.lastDownloaded)}  ·  ${report.errors} errors` : ""}`,
+  );
+  if (sitemap.submitError) ctx.out.warn(sitemap.submitError);
+  if (coverage.reconnectUrl)
+    ctx.out.line(`  Allow resubmission: ${coverage.reconnectUrl}`);
+  ctx.out.line(`  Dashboard       ${coverage.dashboardUrl}`);
+}
+
+async function indexCommand(io: Io, args: string[]) {
+  const { values, positionals } = parseArgs({
+    args,
+    options: {
+      json: { type: "boolean" },
+      project: { type: "string" },
+      undo: { type: "boolean" },
+    },
+    allowPositionals: true,
+    strict: true,
+  });
+  const action = positionals[0] ?? "status";
+  const usage =
+    "Usage: paradigma index [status | requested <url>... [--undo] | check] [--project ID]";
+  if (!["status", "requested", "check"].includes(action))
+    throw new UsageError(usage);
+  if (action !== "requested" && positionals.length > 1)
+    throw new UsageError(usage);
+  const ctx = context(io, Boolean(values.json));
+  const project = await resolveProject(ctx, values.project);
+  if (action === "status") {
+    const coverage = await ctx.client.indexCoverage(project.id);
+    ctx.out.result(coverage, () => printIndexCoverage(ctx, coverage));
+    if (!coverage.connected) process.exitCode = 3;
+    else if (coverage.requests.items.some((item) => !item.requested))
+      process.exitCode = 3;
+    return;
+  }
+  if (action === "requested") {
+    const urls = positionals.slice(1);
+    if (!urls.length || urls.length > 20)
+      throw new UsageError(
+        "Usage: paradigma index requested <url>... (1 to 20 URLs)",
+      );
+    const result = await ctx.client.markIndexRequested(
+      project.id,
+      urls,
+      !values.undo,
+    );
+    ctx.out.result(result, () => {
+      if (result.marked.length)
+        ctx.out.line(
+          `${values.undo ? "Cleared" : "Marked as requested"}: ${result.marked.length} page${result.marked.length === 1 ? "" : "s"}. ${values.undo ? "" : "Paradigma re-checks them after 3 and 7 days."}`.trim(),
+        );
+      for (const url of result.unknown)
+        ctx.out.warn(`Not one of this project's checked pages: ${url}`);
+      const left = result.requests.items.filter((item) => !item.requested);
+      ctx.out.line(
+        left.length
+          ? `${left.length} left to request today.`
+          : "Nothing left to request today.",
+      );
+    });
+    if (result.unknown.length) process.exitCode = 1;
+    return;
+  }
+  const result = await ctx.client.indexCheck(project.id);
+  ctx.out.result(result, () =>
+    ctx.out.line(
+      result.requested
+        ? `Checking now (${result.budget.usedToday}/${result.budget.daily} inspections used today). Run \`paradigma index\` in a few minutes.`
+        : "A check is already running. Run `paradigma index` in a few minutes.",
+    ),
+  );
+}
+
 const COMMANDS: Record<string, (io: Io, args: string[]) => Promise<void>> = {
   links: linksCommand,
+  google: googleCommand,
+  index: indexCommand,
+  indexnow: indexNowCommand,
   projects: projectsCommand,
   verify: verifyCommand,
   audit: auditCommand,

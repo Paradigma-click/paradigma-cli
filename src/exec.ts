@@ -11,6 +11,11 @@ export type ExecOptions = {
   shell?: boolean;
   /** Bytes kept per stream; older output is dropped. */
   maxOutputBytes?: number;
+  /**
+   * Called with each stdout line as it arrives (without the newline), e.g. to follow an agent's
+   * stream live. The full stdout is still kept (bounded) for the result. Errors are ignored.
+   */
+  onStdoutLine?: (line: string) => void;
 };
 
 export type ExecResult = {
@@ -25,6 +30,49 @@ export type ExecResult = {
 };
 
 const DEFAULT_MAX_OUTPUT = 4 * 1024 * 1024;
+/** Longest stdout line handed to `onStdoutLine`; a longer line is dropped whole. */
+const MAX_STREAM_LINE = 1024 * 1024;
+
+/**
+ * Splits a stream into lines for a callback: `push` takes chunks, `end` flushes the last
+ * unterminated line. A line over `maxLine` characters is dropped whole. Never throws.
+ */
+export function lineSplitter(
+  onLine: (line: string) => void,
+  maxLine = MAX_STREAM_LINE,
+) {
+  let pending = "";
+  let dropping = false;
+  const emit = (line: string) => {
+    try {
+      onLine(line.endsWith("\r") ? line.slice(0, -1) : line);
+    } catch {}
+  };
+  return {
+    push(chunk: string) {
+      let start = 0;
+      let index = chunk.indexOf("\n");
+      while (index >= 0) {
+        if (!dropping) emit(pending + chunk.slice(start, index));
+        pending = "";
+        dropping = false;
+        start = index + 1;
+        index = chunk.indexOf("\n", start);
+      }
+      if (dropping) return;
+      pending += chunk.slice(start);
+      if (pending.length > maxLine) {
+        pending = "";
+        dropping = true;
+      }
+    },
+    end() {
+      if (pending && !dropping) emit(pending);
+      pending = "";
+      dropping = false;
+    },
+  };
+}
 
 function keepTail(current: string, chunk: string, max: number) {
   const next = current + chunk;
@@ -50,6 +98,29 @@ export function killTree(pid: number | undefined) {
       process.kill(-pid, "SIGKILL");
     } catch {}
   }, 3000).unref();
+}
+
+/** Children started by `run` that have not exited yet (their own process groups). */
+const liveChildren = new Set<number>();
+
+/**
+ * Kills every child `run` started that is still running, with its whole process group, at once
+ * (SIGKILL). For a forced exit: children run in their own process groups, so a terminal's
+ * Ctrl+C never reaches them and they would outlive the CLI. Never throws.
+ */
+export function killAllChildren() {
+  for (const pid of liveChildren) {
+    try {
+      if (process.platform === "win32") killTree(pid);
+      else process.kill(-pid, "SIGKILL");
+    } catch {}
+  }
+  liveChildren.clear();
+}
+
+/** How many children `run` started are still running (tests). */
+export function liveChildCount() {
+  return liveChildren.size;
 }
 
 /**
@@ -89,10 +160,16 @@ export function run(
       shell: options.shell ?? false,
       windowsHide: true,
     });
+    const pid = child.pid;
+    if (pid) liveChildren.add(pid);
     child.stdout?.setEncoding("utf8");
     child.stderr?.setEncoding("utf8");
+    const lines = options.onStdoutLine
+      ? lineSplitter(options.onStdoutLine)
+      : null;
     child.stdout?.on("data", (chunk: string) => {
       stdout = keepTail(stdout, chunk, max);
+      lines?.push(chunk);
     });
     child.stderr?.on("data", (chunk: string) => {
       stderr = keepTail(stderr, chunk, max);
@@ -113,6 +190,8 @@ export function run(
     const finish = (code: number | null, error?: string) => {
       if (settled) return;
       settled = true;
+      lines?.end();
+      if (pid) liveChildren.delete(pid);
       if (timer) clearTimeout(timer);
       options.signal?.removeEventListener("abort", onAbort);
       resolve({

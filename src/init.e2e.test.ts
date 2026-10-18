@@ -23,8 +23,9 @@ import {
 } from "vitest";
 import { loadConfig } from "./config";
 import { initCommand } from "./init";
-import { ActionRequired } from "./io";
+import { ActionRequired, UsageError } from "./io";
 import { fakeIo, fakeServer } from "./test/platform";
+import { pendingScan, sampleScan } from "./test/scan";
 
 const SERVER = "https://app.paradigma.test";
 const SETUP_TOKEN = `pdg_setup_${"S".repeat(43)}`;
@@ -55,6 +56,14 @@ const server = {
   projectId: null as string | null,
   verified: false,
   exchanged: 0,
+  /** Scan reads that still find the onboarding scan running. */
+  scanRunningFor: 1,
+  scanReads: 0,
+  level: 3,
+  enabled: false,
+  fullAutopilotAllowed: false,
+  /** Sent by newer servers for some accounts; the public CLI ignores it. */
+  runnerAllowed: undefined as boolean | undefined,
 };
 
 function api() {
@@ -135,6 +144,34 @@ function api() {
         },
       };
     },
+    [`GET /api/cli/v1/repos/${REPO}/autopilot/policy`]: () => ({
+      body: {
+        repoId: REPO,
+        policy: { enabled: server.enabled, level: server.level },
+        workspaceDefault: null,
+        fullAutopilotAllowed: server.fullAutopilotAllowed,
+        ...(server.runnerAllowed === undefined
+          ? {}
+          : { runnerAllowed: server.runnerAllowed }),
+      },
+    }),
+    [`POST /api/cli/v1/repos/${REPO}/autopilot/policy`]: (call) => {
+      const body = call.body as { level: number; enabled: boolean };
+      server.level = body.level;
+      server.enabled = body.enabled;
+      return {
+        body: { repoId: REPO, policy: body, workspaceDefault: null },
+      };
+    },
+    [`GET /api/cli/v1/projects/${PROJECT}/scan`]: () => ({
+      body:
+        server.scanReads++ < server.scanRunningFor
+          ? pendingScan(PROJECT)
+          : sampleScan(PROJECT, {
+              locked: !server.verified,
+              ...(server.verified ? { next: null } : {}),
+            }),
+    }),
     [`POST /api/cli/v1/projects/${PROJECT}/verify`]: () => ({
       body: {
         projectId: PROJECT,
@@ -230,6 +267,28 @@ if [ "$1 $2" = "mcp add" ]; then echo "$*" > "$FAKE_STATE/claude-mcp"; exit 0; f
 exit 1
 `,
   );
+  // Fake Vercel CLI: a CLI-only project until \`vercel git connect\` runs.
+  script(
+    join(bin, "vercel"),
+    `#!/bin/sh
+echo "$*" >> "$FAKE_STATE/vercel.log"
+if [ "$1 $2" = "api --help" ]; then echo "vercel api [endpoint] [options]"; exit 0; fi
+if [ "$1" = "api" ]; then
+  case "$2" in
+    /v9/projects/*)
+      if [ -f "$FAKE_STATE/vercel-connected" ]; then
+        echo '{"id":"prj_web","name":"acme-web","link":{"type":"github","org":"acme","repo":"web","productionBranch":"main"}}'
+      else
+        echo '{"id":"prj_web","name":"acme-web","link":null}'
+      fi
+      exit 0 ;;
+    /v7/deployments*) echo '{"deployments":[{"readyState":"READY"}]}'; exit 0 ;;
+  esac
+fi
+if [ "$1 $2" = "git connect" ]; then touch "$FAKE_STATE/vercel-connected"; exit 0; fi
+exit 1
+`,
+  );
 });
 
 afterAll(() => {
@@ -244,15 +303,28 @@ beforeEach(() => {
     projectId: null,
     verified: false,
     exchanged: 0,
+    scanRunningFor: 1,
+    scanReads: 0,
+    level: 3,
+    enabled: false,
+    fullAutopilotAllowed: false,
+    runnerAllowed: undefined,
   });
-  for (const name of ["pr", "claude-mcp", "gh.log"])
+  for (const name of [
+    "pr",
+    "claude-mcp",
+    "gh.log",
+    "vercel.log",
+    "vercel-connected",
+  ])
     rmSync(join(stateDir, name), { force: true });
 });
 afterEach(() => {
   process.exitCode = undefined;
 });
 
-describe("paradigma init", () => {
+// Real git subprocesses: slow when the full suite runs in parallel.
+describe("paradigma init", { timeout: 30_000 }, () => {
   it("runs the whole flow for an agent and resumes idempotently", async () => {
     const fake = api();
     const t = fakeIo({ fetch: fake.fetch, cwd: work, env: env() });
@@ -282,16 +354,58 @@ describe("paradigma init", () => {
       "github_app:action_required",
       "github_app:done",
       "project:done",
+      "deploy:done",
       "domain:action_required",
       "mcp:done",
+      "scan:done",
+      // Fixes are the Paradigma agent's.
+      "fixes:info",
     ]);
+    expect(events.find((e) => e.step === "fixes")).toMatchObject({
+      by: "paradigma",
+      dashboardUrl: `${SERVER}/dashboard/autopilot`,
+    });
     const done = events.at(-1);
+    expect(
+      (done?.next as { id: string }[]).map((item) => item.id),
+    ).not.toContain("schedule");
     expect(done).toMatchObject({
       event: "done",
       ready: false,
       projectId: PROJECT,
       verified: false,
+      // No host config in this repository: reported, never guessed.
+      deploy: { host: null, gitConnected: null, deploysOnMerge: null },
+      scan: {
+        status: "completed",
+        scannedAt: "2026-10-16T09:12:00.000Z",
+        openFixes: 9,
+        locked: true,
+        lockedReason: "Locked until you verify the domain",
+        check: `npx paradigma-cli check all --project ${PROJECT}`,
+      },
     });
+    const scan = done?.scan as {
+      pillars: { name: string; score: number }[];
+      fixes: { title: string; fix: string | null; autopilot: boolean }[];
+    };
+    expect(scan.pillars.map((p) => `${p.name} ${p.score}`)).toEqual([
+      "SEO 92",
+      "AEO 71",
+      "GEO 48",
+      "Agents 96",
+    ]);
+    expect(scan.fixes).toHaveLength(3);
+    expect(scan.fixes[0]).toEqual({
+      title: "AI crawlers may read your pages",
+      pillar: "geo",
+      status: "fail",
+      summary: "robots.txt blocks GPTBot and ClaudeBot",
+      fix: "Allow GPTBot, ClaudeBot and PerplexityBot in robots.txt.",
+      autopilot: true,
+    });
+    // Black box: no pools, weights or tiers reach the agent.
+    expect(JSON.stringify(done)).not.toMatch(/pools|weight|tier|earned/);
 
     // Credential saved; the setup token went only to the exchange body.
     const config = loadConfig();
@@ -306,7 +420,7 @@ describe("paradigma init", () => {
     expect(exchange?.body).toMatchObject({
       token: SETUP_TOKEN,
       runnerName: expect.stringContaining(" on "),
-      agents: expect.arrayContaining([{ name: "claude", version: "2.1.0" }]),
+      agents: [],
     });
     for (const call of fake.calls.filter(
       (c) => !c.path.endsWith("/setup/exchange"),
@@ -384,7 +498,132 @@ describe("paradigma init", () => {
       event: "done",
       ready: true,
       verified: true,
+      scan: { status: "completed", locked: false },
     });
+  });
+
+  it("waits for the scan at most --wait and then says how to check later", async () => {
+    server.installed = true;
+    server.projectId = PROJECT;
+    server.scanRunningFor = Number.POSITIVE_INFINITY;
+    const fake = api();
+    const t = fakeIo({ fetch: fake.fetch, cwd: work, env: env() });
+    await initCommand(t.io, [
+      "--token",
+      SETUP_TOKEN,
+      "--server",
+      SERVER,
+      "--mcp",
+      "none",
+      "--json",
+      "--wait",
+      "20",
+    ]);
+    const events = t.events();
+    expect(events.find((e) => e.step === "scan")).toMatchObject({
+      status: "running",
+    });
+    expect(events.at(-1)).toMatchObject({
+      event: "done",
+      scan: {
+        status: "running",
+        check: `npx paradigma-cli check all --project ${PROJECT}`,
+      },
+    });
+    // 20 s at one read every 5 s, plus the first read; the in-flight scan is never requested again.
+    const reads = fake.calls.filter((c) => c.path.endsWith("/scan"));
+    expect(reads.every((c) => c.method === "GET")).toBe(true);
+    expect(reads).toHaveLength(5);
+
+    // Human output: the scores and the top fixes once the scan is done.
+    server.scanRunningFor = 0;
+    server.scanReads = 0;
+    const human = fakeIo({ fetch: fake.fetch, cwd: work, env: env() });
+    await initCommand(human.io, ["--mcp", "none"]);
+    const text = human.stdout();
+    expect(text).toContain("✓ Site scan: SEO 92 · AEO 71 · GEO 48 · Agents 96");
+    expect(text).toContain("1. AI crawlers may read your pages");
+    expect(text).toContain("3. Every page has a description");
+    expect(text).not.toContain("4. The site has an llms.txt");
+    expect(text).toContain(
+      "Locked until you verify the domain: these fixes are queued as tasks.",
+    );
+  });
+
+  it("checks the deploy pipeline and connects Vercel only with --fix-deploy", async () => {
+    server.installed = true;
+    server.projectId = PROJECT;
+    server.verified = true;
+    mkdirSync(join(work, ".vercel"), { recursive: true });
+    writeFileSync(
+      join(work, ".vercel", "project.json"),
+      JSON.stringify({
+        projectId: "prj_web",
+        orgId: "team_acme",
+        projectName: "acme-web",
+      }),
+    );
+    try {
+      const fake = api();
+      const base = ["--server", SERVER, "--mcp", "none", "--wait", "0"];
+      const report = fakeIo({ fetch: fake.fetch, cwd: work, env: env() });
+      await initCommand(report.io, [
+        "--token",
+        SETUP_TOKEN,
+        ...base,
+        "--json",
+        "--yes",
+      ]);
+      const events = report.events();
+      expect(events.find((e) => e.step === "deploy")).toMatchObject({
+        status: "action_required",
+        host: "vercel",
+        gitConnected: false,
+        evidence: [".vercel/project.json"],
+        wouldRun: "vercel git connect",
+      });
+      expect(events.at(-1)).toMatchObject({
+        event: "done",
+        deploy: {
+          host: "vercel",
+          gitConnected: false,
+          deploysOnMerge: false,
+          blocked: false,
+          fix: "vercel git connect",
+          wouldRun: "vercel git connect",
+        },
+        next: expect.arrayContaining([
+          expect.objectContaining({
+            id: "deploy",
+            command: "vercel git connect",
+          }),
+        ]),
+      });
+      const log = () => readFileSync(join(stateDir, "vercel.log"), "utf8");
+      // --yes alone never changes the host.
+      expect(log()).not.toContain("git connect");
+
+      const human = fakeIo({ fetch: fake.fetch, cwd: work, env: env() });
+      await initCommand(human.io, base);
+      expect(human.stdout()).toContain(
+        "✗ Vercel is not connected to Git, so merged fixes never go live. Fix: vercel git connect",
+      );
+
+      const fixed = fakeIo({ fetch: fake.fetch, cwd: work, env: env() });
+      await initCommand(fixed.io, [...base, "--json", "--yes", "--fix-deploy"]);
+      expect(log()).toContain("git connect --yes --project prj_web");
+      expect(fixed.events().find((e) => e.step === "deploy")).toMatchObject({
+        status: "fixed",
+        gitConnected: true,
+        deploysOnMerge: true,
+        fixed: true,
+      });
+      expect(fixed.events().at(-1)).toMatchObject({
+        deploy: { host: "vercel", gitConnected: true, fix: null, fixed: true },
+      });
+    } finally {
+      rmSync(join(work, ".vercel"), { recursive: true, force: true });
+    }
   });
 
   it("asks for missing fields with inferred candidates instead of guessing", async () => {
@@ -479,6 +718,187 @@ describe("paradigma init", () => {
     expect(t.stdout()).toContain(
       "https://github.com/apps/paradigma/installations/new",
     );
+  });
+
+  it("sets the Autopilot level from --level", async () => {
+    server.installed = true;
+    server.projectId = PROJECT;
+    const fake = api();
+    const t = fakeIo({ fetch: fake.fetch, cwd: work, env: env() });
+    await initCommand(t.io, [
+      "--token",
+      SETUP_TOKEN,
+      "--server",
+      SERVER,
+      "--json",
+      "--yes",
+      "--mcp",
+      "none",
+      "--wait",
+      "0",
+      "--level",
+      "2",
+    ]);
+    const events = t.events();
+    expect(events.find((e) => e.step === "autopilot")).toMatchObject({
+      status: "done",
+      level: 2,
+      label: "Open PR",
+    });
+    // After the scan, before the summary.
+    const order = events.map((e) => e.step ?? e.event);
+    expect(order.indexOf("autopilot")).toBeGreaterThan(order.indexOf("scan"));
+    expect(order.indexOf("autopilot")).toBeLessThan(order.indexOf("done"));
+    expect(
+      fake.calls.find(
+        (c) => c.method === "POST" && c.path.endsWith("/autopilot/policy"),
+      )?.body,
+    ).toEqual({ enabled: true, level: 2 });
+    // The level is set, so the summary no longer suggests it.
+    const next = (events.at(-1)?.next ?? []) as { id: string }[];
+    expect(next.map((item) => item.id)).not.toContain("autopilot");
+  });
+
+  it("validates the Autopilot flags before doing anything", async () => {
+    const fake = api();
+    for (const [flags, message] of [
+      [["--level", "0"], "--confirm-full-autopilot"],
+      [["--level", "4"], "--level must be 0, 1, 2 or 3"],
+    ] as const) {
+      const t = fakeIo({ fetch: fake.fetch, cwd: work, env: env() });
+      const error = await initCommand(t.io, [...flags]).catch((e: Error) => e);
+      expect(error).toBeInstanceOf(UsageError);
+      expect((error as Error).message).toContain(message);
+    }
+    // Agent flags are not part of init.
+    const t = fakeIo({ fetch: fake.fetch, cwd: work, env: env() });
+    await expect(initCommand(t.io, ["--agent", "claude"])).rejects.toThrow(
+      /Unknown option '--agent'/,
+    );
+    expect(fake.calls).toHaveLength(0);
+
+    // Level 0 with the confirmation reaches the server, which decides.
+    server.installed = true;
+    server.projectId = PROJECT;
+    const full = fakeIo({ fetch: fake.fetch, cwd: work, env: env() });
+    await initCommand(full.io, [
+      "--token",
+      SETUP_TOKEN,
+      "--server",
+      SERVER,
+      "--json",
+      "--mcp",
+      "none",
+      "--wait",
+      "0",
+      "--level",
+      "0",
+      "--confirm-full-autopilot",
+    ]);
+    expect(
+      fake.calls.find(
+        (c) => c.method === "POST" && c.path.endsWith("/autopilot/policy"),
+      )?.body,
+    ).toEqual({ enabled: true, level: 0, confirmFullAutopilot: true });
+  });
+
+  it("asks the level after the scan", async () => {
+    server.installed = true;
+    server.projectId = PROJECT;
+    server.level = 2;
+    const fake = api();
+    const t = fakeIo({
+      fetch: fake.fetch,
+      cwd: work,
+      env: env(),
+      interactive: true,
+      // Level (Enter keeps 2).
+      answers: [""],
+    });
+    await initCommand(t.io, [
+      "--token",
+      SETUP_TOKEN,
+      "--server",
+      SERVER,
+      "--mcp",
+      "none",
+      "--wait",
+      "0",
+    ]);
+    const text = t.stdout();
+    expect(text).toContain(
+      "Autopilot for acme/web: 3 Notify, 2 Open PR, 1 Autopilot (merges low-risk fixes).",
+    );
+    expect(text).not.toContain("Full autopilot");
+    expect(text).toContain("✓ Autopilot on at level 2 (Open PR)");
+    expect(server).toMatchObject({ level: 2, enabled: true });
+
+    // "skip" leaves it alone.
+    const skipped = fakeIo({
+      fetch: fake.fetch,
+      cwd: work,
+      env: env(),
+      interactive: true,
+      answers: ["skip"],
+    });
+    const before = fake.calls.length;
+    await initCommand(skipped.io, ["--mcp", "none", "--wait", "0"]);
+    expect(
+      fake.calls
+        .slice(before)
+        .filter((c) => c.method === "POST" && /autopilot/.test(c.path)),
+    ).toEqual([]);
+  });
+
+  it("points to the Paradigma agent for fixes, whatever the server sends", async () => {
+    server.installed = true;
+    server.projectId = PROJECT;
+    server.runnerAllowed = true;
+    const fake = api();
+    const t = fakeIo({ fetch: fake.fetch, cwd: work, env: env() });
+    await initCommand(t.io, [
+      "--token",
+      SETUP_TOKEN,
+      "--server",
+      SERVER,
+      "--json",
+      "--mcp",
+      "none",
+      "--wait",
+      "0",
+      "--level",
+      "2",
+    ]);
+    const events = t.events();
+    expect(events.find((e) => e.step === "autopilot")).toMatchObject({
+      status: "done",
+      level: 2,
+    });
+    expect(events.find((e) => e.step === "agent")).toBeUndefined();
+    expect(events.find((e) => e.step === "fixes")).toEqual({
+      event: "step",
+      step: "fixes",
+      status: "info",
+      by: "paradigma",
+      dashboardUrl: `${SERVER}/dashboard/autopilot`,
+    });
+    expect(fake.calls.some((c) => c.path === "/api/cli/v1/runner")).toBe(false);
+    const next = (events.at(-1)?.next ?? []) as { id: string }[];
+    expect(next.map((item) => item.id)).not.toContain("schedule");
+
+    // A terminal session is never asked for an agent.
+    const asked = fakeIo({
+      fetch: fake.fetch,
+      cwd: work,
+      env: env(),
+      interactive: true,
+      answers: ["skip"],
+    });
+    await initCommand(asked.io, ["--mcp", "none", "--wait", "0"]);
+    expect(asked.stdout()).toContain(
+      "Fixes are made by the Paradigma agent, hosted or in your GitHub Actions.",
+    );
+    expect(asked.stdout()).not.toContain("Agent for Autopilot fixes");
   });
 
   it("rejects a malformed token without echoing it", async () => {

@@ -8,7 +8,6 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { run, runOk } from "./exec";
-import { parsePrUrl } from "./publish";
 
 /**
  * Publishes the domain verification file for `paradigma init`: on a branch
@@ -213,4 +212,15 @@ export async function publishVerificationFile(input: {
       `Could not open a PR (${(error as Error).message.slice(0, 200)})`,
     );
   }
+}
+
+/** The PR URL and number from `gh pr create` output. */
+export function parsePrUrl(
+  output: string,
+): { prUrl: string; prNumber: number } | null {
+  const match = /https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/(\d+)/.exec(
+    output,
+  );
+  if (!match) return null;
+  return { prUrl: match[0], prNumber: Number(match[1]) };
 }

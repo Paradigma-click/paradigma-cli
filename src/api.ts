@@ -1,14 +1,7 @@
 import { z } from "zod";
 import {
-  type ClaimRequest,
-  claimRequestSchema,
-  claimResponseSchema,
-  heartbeatResponseSchema,
   pairPollResponseSchema,
   pairStartResponseSchema,
-  policyResponseSchema,
-  type ReportRequest,
-  reportRequestSchema,
 } from "./contract/autopilot";
 
 export type ApiErrorCode =
@@ -58,8 +51,8 @@ export function normalizeServer(server: string): string {
 }
 
 /**
- * REST client for the Autopilot API. Every response is parsed with the shared
- * contract, and every report is validated as metadata-only before sending.
+ * REST client for device pairing and the server's public key. Every response is parsed with the
+ * shared contract.
  */
 export class ApiClient {
   readonly server: string;
@@ -76,7 +69,7 @@ export class ApiClient {
     this.userAgent = options.userAgent ?? "paradigma-cli";
   }
 
-  private async request<T>(
+  protected async request<T>(
     method: "GET" | "POST",
     path: string,
     schema: z.ZodType<T>,
@@ -92,7 +85,7 @@ export class ApiClient {
       if (!this.token)
         throw new ApiError(
           "unauthorized",
-          "Not paired. Run `paradigma setup`.",
+          "Not signed in. Run `npx paradigma-cli init` first.",
         );
       headers.authorization = `Bearer ${this.token}`;
     }
@@ -115,11 +108,7 @@ export class ApiClient {
       );
     }
     if (response.status === 401)
-      throw new ApiError(
-        "unauthorized",
-        "The runner token was rejected. Run `paradigma setup` again.",
-        401,
-      );
+      throw new ApiError("unauthorized", this.statusMessage(401, path), 401);
     if (response.status === 403)
       throw new ApiError(
         "forbidden",
@@ -127,20 +116,9 @@ export class ApiClient {
         403,
       );
     if (response.status === 404)
-      throw new ApiError(
-        "disabled",
-        path.startsWith("/api/autopilot/report") ||
-          path.startsWith("/api/autopilot/heartbeat")
-          ? "The server does not know this task (404)."
-          : "Autopilot is not enabled on this server (404).",
-        404,
-      );
+      throw new ApiError("disabled", this.statusMessage(404, path), 404);
     if (response.status === 409)
-      throw new ApiError(
-        "conflict",
-        "The task lease expired or the transition is invalid (409).",
-        409,
-      );
+      throw new ApiError("conflict", this.statusMessage(409, path), 409);
     if (response.status === 422)
       throw new ApiError(
         "invalid_request",
@@ -174,6 +152,14 @@ export class ApiClient {
     return parsed.data;
   }
 
+  /** The message for a 401, 404 or 409 on `path`. */
+  protected statusMessage(status: 401 | 404 | 409, _path: string): string {
+    if (status === 401)
+      return "The CLI credential was rejected. Run `npx paradigma-cli init` again.";
+    if (status === 404) return "Autopilot is not enabled on this server (404).";
+    return "The request conflicts with the current state (409).";
+  }
+
   pairStart(machineName: string, platform: string) {
     return this.request(
       "POST",
@@ -205,33 +191,5 @@ export class ApiClient {
       undefined,
       false,
     );
-  }
-
-  policy() {
-    return this.request("GET", "/api/autopilot/policy", policyResponseSchema);
-  }
-
-  claim(request: Partial<ClaimRequest>) {
-    return this.request(
-      "POST",
-      "/api/autopilot/claim",
-      claimResponseSchema,
-      claimRequestSchema.parse(request),
-    );
-  }
-
-  heartbeat(taskIds: string[]) {
-    return this.request(
-      "POST",
-      "/api/autopilot/heartbeat",
-      heartbeatResponseSchema,
-      { taskIds },
-    );
-  }
-
-  /** Throws before sending if the report is not metadata-only. */
-  async report(request: ReportRequest) {
-    const body = reportRequestSchema.parse(request);
-    return this.request("POST", "/api/autopilot/report", z.unknown(), body);
   }
 }

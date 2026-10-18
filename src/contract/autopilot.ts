@@ -25,6 +25,111 @@ export const LEVEL_LABELS: Record<AutopilotLevel, string> = {
   3: "Notify",
 };
 
+/**
+ * Coding agents a runner may be told to prefer. `null` (Auto) lets the runner
+ * pick from what is installed. `custom` (PARADIGMA_AGENT_COMMAND) is only
+ * ever chosen on the machine itself.
+ */
+export const RUNNER_AGENTS = ["claude", "codex", "cursor"] as const;
+export type RunnerAgent = (typeof RUNNER_AGENTS)[number];
+export const runnerAgentSchema = z.enum(RUNNER_AGENTS);
+
+/**
+ * Who does a repository's fixes: `paradigma` (the hosted Paradigma agent, on
+ * Paradigma's servers) or `runner` (this CLI with a local coding agent). A
+ * runner never claims the tasks a repository gives the hosted agent.
+ */
+export const FIX_AGENTS = ["paradigma", "runner"] as const;
+export type FixAgentChoice = (typeof FIX_AGENTS)[number];
+export const fixAgentSchema = z.enum(FIX_AGENTS);
+
+/**
+ * Where a repository's fixes run (docs/36 §0, 18/10/2026): `auto` routes each task (hosted by
+ * default, the GitHub Action when the task needs a build or tests, or when hosted cannot run),
+ * `hosted` only on Paradigma's servers, `github` only in the customer's GitHub Actions. `local`
+ * (the local runner) exists for internal admins only and is never offered to anyone else.
+ */
+export const FIX_MODES = ["auto", "hosted", "github", "local"] as const;
+export type FixMode = (typeof FIX_MODES)[number];
+export const fixModeSchema = z.enum(FIX_MODES);
+/** The fix modes every account may choose. */
+export const PUBLIC_FIX_MODES = ["auto", "hosted", "github"] as const;
+
+/** Model names or aliases passed to the agent CLI as is (`opus`, `gpt-5-codex`); never a flag. */
+export const RUNNER_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+export const RUNNER_MODEL_MAX = 64;
+export const runnerModelSchema = z
+  .string()
+  .min(1)
+  .max(RUNNER_MODEL_MAX)
+  .regex(RUNNER_MODEL_PATTERN);
+
+/**
+ * Reasoning effort levels an agent CLI may accept. Claude Code takes all of
+ * them (`--effort`), Codex all but "max" (`-c model_reasoning_effort=…`),
+ * Cursor none. A custom agent command reads the level from
+ * PARADIGMA_AGENT_EFFORT.
+ */
+export const RUNNER_EFFORTS = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+export type RunnerEffort = (typeof RUNNER_EFFORTS)[number];
+export const runnerEffortSchema = z.enum(RUNNER_EFFORTS);
+
+export const EFFORTS_BY_AGENT: Record<
+  RunnerAgent | "custom",
+  readonly RunnerEffort[]
+> = {
+  claude: RUNNER_EFFORTS,
+  codex: ["low", "medium", "high", "xhigh", "max"],
+  cursor: [],
+  custom: RUNNER_EFFORTS,
+};
+
+/**
+ * The effort level when `agent` accepts it, else null. With no agent (Auto)
+ * any known level is kept: it applies once an agent that accepts it is
+ * picked. Pure.
+ */
+export function validEffort(
+  agent: string | null | undefined,
+  value: unknown,
+): RunnerEffort | null {
+  if (typeof value !== "string") return null;
+  const level = value.trim().toLowerCase();
+  if (!(RUNNER_EFFORTS as readonly string[]).includes(level)) return null;
+  if (!agent) return level as RunnerEffort;
+  const allowed = EFFORTS_BY_AGENT[agent as RunnerAgent | "custom"];
+  return allowed?.includes(level as RunnerEffort)
+    ? (level as RunnerEffort)
+    : null;
+}
+
+/**
+ * Agent, model and effort a runner should use; null means Auto / the agent's
+ * default. `effort` is optional: older servers omit it and older runners
+ * ignore it.
+ */
+export const runnerPreferenceSchema = z.object({
+  agent: runnerAgentSchema.nullable(),
+  model: runnerModelSchema.nullable(),
+  effort: runnerEffortSchema.nullable().optional(),
+});
+export type RunnerPreference = z.infer<typeof runnerPreferenceSchema>;
+
+/** An agent found on the runner's machine. */
+export const reportedAgentSchema = z.object({
+  name: z.string().max(40),
+  version: z.string().max(80).nullable(),
+  /** Whether the agent CLI is signed in; absent when unknown. */
+  loggedIn: z.boolean().nullable().optional(),
+});
+export type ReportedAgent = z.infer<typeof reportedAgentSchema>;
+
 export const TASK_CATEGORIES = [
   "metadata",
   "robots",
@@ -36,9 +141,45 @@ export const TASK_CATEGORIES = [
   "routes",
   "performance",
   "content",
+  "agent_discovery",
+  "server_rendering",
   "revert",
+  /**
+   * A project setup step (`setup/<step>` kinds): a connection or an install
+   * a project still lacks, such as the Google Analytics tag. Servers send it
+   * only to runners that know it; older runners get the payload as
+   * `metadata` with risk medium, so it never auto-merges as low risk.
+   */
+  "setup",
+  /**
+   * Penalty risk cleanup (docs/35, phase 7): remove hidden or injected text, qualify paid links,
+   * drop self-serving review markup, propose noindex or 301 merges, fix hreflang and lang, remove
+   * generated-text leftovers, stop fake `lastmod` bumps, align an llms.txt mirror. Never
+   * auto-merged at any level, level 0 included: it always opens a draft pull request for the
+   * owner (`neverAutoMerges`). Servers send it only to runners that know it.
+   */
+  "policy_cleanup",
 ] as const;
 export type TaskCategory = (typeof TASK_CATEGORIES)[number];
+
+/**
+ * Categories that never auto-merge, at any level (level 0 included): the pull request always
+ * waits for the owner. Every merge decision checks this (the server's mode, the runner's
+ * effective mode, the hosted agent's mode and the report transitions), not only the planner.
+ */
+export const NEVER_AUTO_MERGE_CATEGORIES: readonly TaskCategory[] = [
+  "policy_cleanup",
+];
+
+/** Whether a task of this category must never be merged without the owner. Pure. */
+export function neverAutoMerges(category: string): boolean {
+  return (NEVER_AUTO_MERGE_CATEGORIES as readonly string[]).includes(category);
+}
+
+/** Categories whose pull request opens as a draft: a proposal the owner reviews. */
+export function opensDraftPullRequest(category: string): boolean {
+  return neverAutoMerges(category);
+}
 
 /** Categories that may auto-merge at level 1. Only level 0 merges the rest. */
 export const LOW_RISK_CATEGORIES: readonly TaskCategory[] = [
@@ -138,8 +279,17 @@ export const autopilotTaskResultSchema = z
   .object({
     agent: z
       .object({
-        name: z.enum(["claude", "codex", "cursor", "custom"]),
+        /** `paradigma` is the hosted agent; runners report their own agent. */
+        name: z.enum(["claude", "codex", "cursor", "custom", "paradigma"]),
         version: z.string().max(80).nullable(),
+        /**
+         * The model asked for, else the one the agent reported; null: unknown
+         * (its default). Lenient on purpose: a model name never fails a
+         * report; the server keeps it only when it matches `runnerModelSchema`.
+         */
+        model: z.string().max(120).nullable().optional(),
+        /** The effort level asked for; null or absent: the agent's default. */
+        effort: z.string().max(20).nullable().optional(),
       })
       .optional(),
     files: z.array(z.string().min(1).max(300)).max(50).optional(),
@@ -183,16 +333,16 @@ export type ReportRequest = z.infer<typeof reportRequestSchema>;
 export const claimRequestSchema = z.object({
   /** Only plan/claim for these repositories (the ones mapped locally). */
   repoIds: z.array(z.uuid()).max(200).optional(),
+  /** Only claim tasks of these projects (site ids); absent: every project. */
+  siteIds: z.array(z.uuid()).max(200).optional(),
+  /**
+   * The background run request this claim serves (`/api/cli/v1/run-requests`).
+   * A valid one lets the server claim on its repository even when Autopilot
+   * is off there: the person asked. Older runners send neither field.
+   */
+  requestId: z.uuid().optional(),
   max: z.number().int().min(1).max(20).default(5),
-  agents: z
-    .array(
-      z.object({
-        name: z.string().max(40),
-        version: z.string().max(80).nullable(),
-      }),
-    )
-    .max(5)
-    .default([]),
+  agents: z.array(reportedAgentSchema).max(5).default([]),
   version: z.string().max(40).optional(),
 });
 export type ClaimRequest = z.infer<typeof claimRequestSchema>;
@@ -201,15 +351,47 @@ export const claimResponseSchema = z.object({
   tasks: z.array(signedTaskSchema),
   /** Present when nothing was claimed, e.g. "outside_run_window". */
   reason: z.string().max(80).optional(),
+  /**
+   * The agent and model chosen for this runner in the dashboard (nulls mean
+   * Auto and the agent's default). Outside the signed task bodies; absent
+   * from older servers.
+   */
+  runner: runnerPreferenceSchema.nullish(),
 });
 export type ClaimResponse = z.infer<typeof claimResponseSchema>;
 
 export const heartbeatRequestSchema = z.object({
   taskIds: z.array(z.uuid()).max(20),
+  /** Agents installed on the machine; replaces the stored list when non-empty. */
+  agents: z.array(reportedAgentSchema).max(5).optional().catch(undefined),
+  /**
+   * The agent and model this run actually uses (after flags, the dashboard's
+   * choice and local config). Shown as the runner's current agent; it never
+   * changes the dashboard's choice. Invalid values are ignored rather than
+   * failing the heartbeat.
+   */
+  preferred: z
+    .object({
+      agent: z.string().min(1).max(40),
+      model: z.string().max(120).nullable().optional(),
+      effort: z.string().max(20).nullable().optional(),
+    })
+    .optional()
+    .catch(undefined),
+  /**
+   * Tasks the runner gives back without finishing them (paused or
+   * interrupted): they return to the queue without using an attempt. Older
+   * servers ignore it and the lease simply expires.
+   */
+  release: z.array(z.uuid()).max(20).optional().catch(undefined),
 });
 export const heartbeatResponseSchema = z.object({
   /** Tasks the runner must stop (paused, cancelled or lease lost). */
   cancel: z.array(z.uuid()),
+  /** Tasks from `release` that went back to the queue; absent from older servers. */
+  released: z.array(z.uuid()).optional(),
+  /** The runner's current preference, as in the claim response. */
+  runner: runnerPreferenceSchema.nullish(),
 });
 
 export const repoPolicyViewSchema = z.object({
@@ -221,10 +403,20 @@ export const repoPolicyViewSchema = z.object({
   paused: z.boolean(),
   runHour: z.number().int().min(0).max(23),
   timezone: z.string(),
+  /**
+   * Who does the repository's fixes; `paradigma` repositories are worked on
+   * Paradigma's servers once the organization consented. Absent from older
+   * servers (the runner).
+   */
+  agent: fixAgentSchema.optional(),
+  /** Where the repository's fixes run; absent from older servers. */
+  fixMode: fixModeSchema.optional(),
 });
 export const policyResponseSchema = z.object({
   runnerId: z.uuid(),
   repos: z.array(repoPolicyViewSchema),
+  /** The runner's preference, as in the claim response. */
+  runner: runnerPreferenceSchema.nullish(),
 });
 export type PolicyResponse = z.infer<typeof policyResponseSchema>;
 

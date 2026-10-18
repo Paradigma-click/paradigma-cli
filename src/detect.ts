@@ -198,6 +198,63 @@ export function layoutMetadata(source: string) {
 const SITE_URL_KEYS =
   /^(?:NEXT_PUBLIC_)?(?:SITE_URL|APP_URL|BASE_URL|URL|PRODUCTION_URL|WEBSITE_URL|DOMAIN)\s*=\s*["']?(https:\/\/[^\s"'#]+)/gm;
 
+/**
+ * Where other frameworks declare the production URL, read as text (never
+ * executed): Astro `site`, Gatsby `siteUrl`, Docusaurus/Jekyll `url`, Nuxt
+ * `site.url`, Hugo `baseURL`.
+ */
+const FRAMEWORK_URL_SOURCES: {
+  files: string[];
+  label: string;
+  pattern: RegExp;
+}[] = [
+  {
+    files: ["astro.config.mjs", "astro.config.ts", "astro.config.js"],
+    label: "astro.config site",
+    pattern: /\bsite\s*:\s*(["'`])(https:\/\/[^"'`\s$]+)\1/,
+  },
+  {
+    files: ["gatsby-config.js", "gatsby-config.ts", "gatsby-config.mjs"],
+    label: "gatsby-config siteUrl",
+    pattern: /\bsiteUrl\s*:\s*(["'`])(https:\/\/[^"'`\s$]+)\1/,
+  },
+  {
+    files: ["docusaurus.config.js", "docusaurus.config.ts"],
+    label: "docusaurus.config url",
+    pattern: /\burl\s*:\s*(["'`])(https:\/\/[^"'`\s$]+)\1/,
+  },
+  {
+    files: ["nuxt.config.ts", "nuxt.config.js"],
+    label: "nuxt.config site url",
+    pattern: /\burl\s*:\s*(["'`])(https:\/\/[^"'`\s$]+)\1/,
+  },
+  {
+    files: ["hugo.toml", "config.toml"],
+    label: "Hugo baseURL",
+    pattern: /^\s*baseURL\s*=\s*(["'])(https:\/\/[^"'\s]+)\1/m,
+  },
+  {
+    files: ["hugo.yaml", "hugo.yml", "config.yaml"],
+    label: "Hugo baseURL",
+    pattern: /^\s*baseURL\s*:\s*(["']?)(https:\/\/[^"'\s#]+)\1/m,
+  },
+  {
+    files: ["_config.yml"],
+    label: "Jekyll url",
+    pattern: /^url\s*:\s*(["']?)(https:\/\/[^"'\s#]+)\1/m,
+  },
+];
+
+/** Pure: the production URL a framework config file declares, if any. */
+export function frameworkConfigUrl(file: string, source: string) {
+  for (const entry of FRAMEWORK_URL_SOURCES)
+    if (entry.files.includes(file)) {
+      const url = entry.pattern.exec(source)?.[2];
+      if (url) return { url, label: entry.label };
+    }
+  return null;
+}
+
 /** Candidate production URLs, brands and descriptions for an app directory. */
 export function inferSiteCandidates(
   repoRoot: string,
@@ -237,6 +294,14 @@ export function inferSiteCandidates(
   }
 
   for (const dir of dirs)
+    for (const entry of FRAMEWORK_URL_SOURCES)
+      for (const file of entry.files) {
+        const source = readSmall(join(dir, file));
+        const found = source ? frameworkConfigUrl(file, source) : null;
+        if (found) addUrl(urls, found.url, found.label, true);
+      }
+
+  for (const dir of dirs)
     for (const file of [".env.example", ".env.sample"]) {
       const text = readSmall(join(dir, file));
       if (!text) continue;
@@ -244,10 +309,19 @@ export function inferSiteCandidates(
         addUrl(urls, match[1], file);
     }
 
-  for (const dir of [join(appDir, "public"), join(repoRoot, "public")]) {
+  // GitHub Pages custom domains, wherever the framework serves static files.
+  for (const dir of [
+    ...new Set([
+      join(appDir, "public"),
+      join(appDir, "static"),
+      appDir,
+      join(repoRoot, "public"),
+      repoRoot,
+    ]),
+  ]) {
     const cname = readSmall(join(dir, "CNAME"))?.trim();
     if (cname && /^[a-z0-9.-]+$/i.test(cname))
-      addUrl(urls, `https://${cname}`, "public/CNAME", true);
+      addUrl(urls, `https://${cname}`, "CNAME", true);
   }
 
   for (const dir of dirs) {

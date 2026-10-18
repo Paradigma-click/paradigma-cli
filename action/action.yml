@@ -1,0 +1,55 @@
+name: Paradigma fix
+description: >-
+  Runs one Paradigma fix in your own GitHub Actions: the Paradigma agent edits the files the
+  task allows, Paradigma checks the edit, and a pull request opens with the workflow's token.
+  The model comes from Paradigma (no secret needed), or from your own key if you turn on Use my
+  own key in Paradigma.
+author: Paradigma
+branding:
+  icon: check-square
+  color: gray-dark
+inputs:
+  task:
+    description: The signed task token from Paradigma's repository_dispatch (client_payload.task).
+    required: true
+  api-url:
+    description: The Paradigma server that issued the task.
+    required: false
+    default: https://paradigma.click
+  build-command:
+    description: Optional build command, run before the pull request opens.
+    required: false
+    default: ""
+  test-command:
+    description: Optional test command, run before the pull request opens.
+    required: false
+    default: ""
+  cli-version:
+    description: The paradigma-cli version to run (bumped with each release of this action).
+    required: false
+    default: "0.12.0"
+  node-version:
+    description: Node.js version for the CLI.
+    required: false
+    default: "20"
+runs:
+  using: composite
+  steps:
+    - name: Mask the task token
+      shell: bash
+      env:
+        PARADIGMA_FIX_TASK: ${{ inputs.task }}
+      run: echo "::add-mask::${PARADIGMA_FIX_TASK}"
+    - uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+    - name: Run the Paradigma fix
+      shell: bash
+      env:
+        PARADIGMA_FIX_TASK: ${{ inputs.task }}
+        PARADIGMA_API_URL: ${{ inputs.api-url }}
+        PARADIGMA_BUILD_COMMAND: ${{ inputs.build-command }}
+        PARADIGMA_TEST_COMMAND: ${{ inputs.test-command }}
+        PARADIGMA_CLI_VERSION: ${{ inputs.cli-version }}
+        GITHUB_TOKEN: ${{ github.token }}
+      run: npx --yes "paradigma-cli@${PARADIGMA_CLI_VERSION}" fix

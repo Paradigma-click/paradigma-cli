@@ -13,6 +13,7 @@ import { saveConfig } from "./config";
 import {
   brandFromPackageName,
   chooseAppRoot,
+  frameworkConfigUrl,
   inferSiteCandidates,
   layoutMetadata,
   productionOrigin,
@@ -295,6 +296,33 @@ describe("GEO, billing and Autopilot guards", () => {
       enabled: false,
       dailyLimit: 3,
     });
+    await expect(
+      platformCommand(
+        "geo",
+        ["schedule", "--engine", "openai", "--every", "7", "--off"],
+        t.io,
+      ),
+    ).rejects.toThrow(/google_ai_mode/);
+    await platformCommand(
+      "geo",
+      [
+        "schedule",
+        "--engine",
+        "google_ai_mode",
+        "--daily",
+        "3",
+        "--every",
+        "1",
+        "--accept-charges",
+      ],
+      t.io,
+    );
+    expect(server.calls.at(-1)?.body).toMatchObject({
+      engine: "google_ai_mode",
+      enabled: true,
+      dailyLimit: 3,
+      intervalDays: 1,
+    });
   });
 
   it("autopilot level 0 needs --confirm-full-autopilot", async () => {
@@ -335,6 +363,135 @@ describe("GEO, billing and Autopilot guards", () => {
       level: 0,
       confirmFullAutopilot: true,
     });
+  });
+
+  const targetsRoute = () => ({
+    body: {
+      repositories: [
+        {
+          repoId: REPO,
+          orgId: ORG,
+          owner: "acme",
+          name: "web",
+          fullName: "acme/web",
+          enabled: true,
+          apps: [],
+        },
+      ],
+      installGithubAppUrl: null,
+    },
+  });
+
+  it("autopilot level says when it overrides the workspace default", async () => {
+    let workspaceDefault: unknown = null;
+    const server = fakeServer({
+      "GET /api/cli/v1/targets": targetsRoute,
+      "POST /api/cli/v1/repos/33333333-3333-4333-8333-333333333333/autopilot/policy":
+        () => ({
+          body: {
+            repoId: REPO,
+            policy: { enabled: true, level: 2, inherits: false },
+            workspaceDefault,
+          },
+        }),
+    });
+    const t = fakeIo({ fetch: server.fetch, cwd: cwd() });
+    await platformCommand(
+      "autopilot",
+      ["level", "2", "--repo", "acme/web"],
+      t.io,
+    );
+    expect(t.stdout()).toContain(
+      "Autopilot on at level 2 (Open PR) for repository acme/web.",
+    );
+    workspaceDefault = { orgId: ORG, enabled: true, level: 0 };
+    await platformCommand(
+      "autopilot",
+      ["level", "2", "--repo", "acme/web"],
+      t.io,
+    );
+    expect(t.stdout()).toContain(
+      "Autopilot on at level 2 (Open PR) for repository acme/web (overrides the workspace default).",
+    );
+  });
+
+  it("autopilot default sets the workspace default for the repository's org", async () => {
+    const server = fakeServer({
+      "GET /api/cli/v1/targets": targetsRoute,
+      "POST /api/cli/v1/orgs/22222222-2222-4222-8222-222222222222/autopilot/default":
+        () => ({
+          body: {
+            orgId: ORG,
+            workspaceDefault: { orgId: ORG, enabled: true, level: 0 },
+            updated: 2,
+            inserted: 1,
+          },
+        }),
+    });
+    const t = fakeIo({ fetch: server.fetch, cwd: cwd() });
+    await expect(
+      platformCommand("autopilot", ["default", "0"], t.io),
+    ).rejects.toThrow(/confirm-full-autopilot/);
+    await expect(
+      platformCommand("autopilot", ["default", "5"], t.io),
+    ).rejects.toThrow(/0, 1, 2, 3 or off/);
+    expect(server.calls).toHaveLength(0);
+    await platformCommand(
+      "autopilot",
+      ["default", "0", "--confirm-full-autopilot"],
+      t.io,
+    );
+    expect(server.calls.at(-1)?.body).toEqual({
+      level: 0,
+      enabled: true,
+      confirmFullAutopilot: true,
+    });
+    expect(t.stdout()).toContain(
+      `Workspace default set to level 0 (Full autopilot) for organization ${ORG}.`,
+    );
+    expect(t.stdout()).toContain("3 repositories follow it (1 new).");
+    await platformCommand("autopilot", ["default", "off", "--org", ORG], t.io);
+    expect(server.calls.at(-1)?.body).toEqual({ level: 3, enabled: false });
+    await expect(
+      platformCommand("autopilot", ["default", "1", "--org", "acme"], t.io),
+    ).rejects.toThrow(/--org must be/);
+  });
+
+  it("autopilot follow-default switches a repository back to the default", async () => {
+    let workspaceDefault: unknown = { orgId: ORG, enabled: true, level: 1 };
+    const server = fakeServer({
+      "GET /api/cli/v1/targets": targetsRoute,
+      "POST /api/cli/v1/repos/33333333-3333-4333-8333-333333333333/autopilot/follow-default":
+        () => ({
+          body: {
+            repoId: REPO,
+            policy: workspaceDefault
+              ? { enabled: true, level: 1, inherits: true }
+              : { enabled: false, level: 3, inherits: true },
+            workspaceDefault,
+          },
+        }),
+    });
+    const t = fakeIo({ fetch: server.fetch, cwd: cwd() });
+    await platformCommand(
+      "autopilot",
+      ["follow-default", "--repo", "acme/web"],
+      t.io,
+    );
+    expect(server.calls.at(-1)?.body).toEqual({});
+    expect(t.stdout()).toContain(
+      "acme/web now follows the workspace default: level 1 (Autopilot).",
+    );
+    workspaceDefault = null;
+    await platformCommand(
+      "autopilot",
+      ["follow-default", "--repo", "acme/web", "--confirm-full-autopilot"],
+      t.io,
+    );
+    expect(server.calls.at(-1)?.body).toEqual({ confirmFullAutopilot: true });
+    expect(t.stdout()).toContain(
+      "No workspace default yet: acme/web is back on the built-in default (off, level 3 (Notify))",
+    );
   });
 
   it("billing checkout prints and optionally opens the hosted URL", async () => {
@@ -416,6 +573,392 @@ describe("verify, sync and JSON errors", () => {
     expect(t.stdout()).toContain(
       `npx paradigma-cli verify --project ${PROJECT}`,
     );
+  });
+
+  it("google waits for consent, then shows the PR and the GA4 tag", async () => {
+    const pending = {
+      projectId: PROJECT,
+      verified: true,
+      started: false,
+      done: false,
+      startUrl: `${SERVER}/dashboard/sites/${PROJECT}/connect/google`,
+      searchConsole: {
+        status: "not_started",
+        property: null,
+        file: null,
+        pullUrl: null,
+      },
+      analytics: {
+        status: "not_started",
+        propertyId: null,
+        measurementId: null,
+        accounts: [],
+        createAccountUrl: null,
+        tagInstructions: null,
+      },
+      lastError: null,
+    };
+    const started = {
+      ...pending,
+      started: true,
+      searchConsole: {
+        status: "awaiting_deploy",
+        property: "https://acme.test/",
+        file: {
+          name: "google0123456789abcdef.html",
+          repoPath: "public/google0123456789abcdef.html",
+          url: "https://acme.test/google0123456789abcdef.html",
+          contents: "google-site-verification: google0123456789abcdef.html",
+        },
+        pullUrl: "https://github.com/acme/web/pull/7",
+      },
+      analytics: {
+        ...pending.analytics,
+        status: "created",
+        propertyId: "123",
+        measurementId: "G-ABC123",
+        tagInstructions:
+          "Add the Google Analytics 4 tag with measurement ID G-ABC123.",
+      },
+    };
+    let polls = 0;
+    const server = fakeServer({
+      "GET /api/cli/v1/projects": projectsRoute,
+      [`GET /api/cli/v1/projects/${PROJECT}/google`]: () => ({
+        body: polls++ < 2 ? pending : started,
+      }),
+    });
+    const t = fakeIo({ fetch: server.fetch, cwd: cwd(), interactive: true });
+    await platformCommand("google", [], t.io);
+    expect(t.opened).toEqual([pending.startUrl]);
+    expect(t.stdout()).toContain("public/google0123456789abcdef.html");
+    expect(t.stdout()).toContain("https://github.com/acme/web/pull/7");
+    expect(t.stdout()).toContain("G-ABC123");
+    expect(process.exitCode).toBe(3);
+  });
+
+  const indexNow = (overrides: Record<string, unknown> = {}) => ({
+    projectId: PROJECT,
+    productionUrl: "https://acme.test",
+    state: "active",
+    keyFilePath: "public/0123456789abcdef0123456789abcdef.txt",
+    keyFileUrl: "https://acme.test/0123456789abcdef0123456789abcdef.txt",
+    pullRequestUrl: "https://github.com/acme/web/pull/9",
+    recentDeploys: [
+      {
+        urlCount: 3,
+        outcome: "submitted",
+        httpStatus: 202,
+        submittedAt: "2026-10-14T10:05:00.000Z",
+      },
+      {
+        urlCount: 0,
+        outcome: "nothing_changed",
+        httpStatus: null,
+        submittedAt: "2026-10-13T09:00:00.000Z",
+      },
+    ],
+    settingsUrl: `${SERVER}/dashboard/sites/${PROJECT}/settings#indexnow`,
+    ...overrides,
+  });
+
+  it("indexnow shows the state and recent deploys", async () => {
+    const server = fakeServer({
+      "GET /api/cli/v1/projects": projectsRoute,
+      [`GET /api/cli/v1/projects/${PROJECT}/indexnow`]: () => ({
+        body: indexNow(),
+      }),
+    });
+    const t = fakeIo({ fetch: server.fetch, cwd: cwd() });
+    await platformCommand("indexnow", [], t.io);
+    const out = t.stdout();
+    expect(out).toContain("IndexNow          on");
+    expect(out).toContain("public/0123456789abcdef0123456789abcdef.txt");
+    expect(out).toContain("2026-10-14 10:05  submitted  3 URLs  (HTTP 202)");
+    expect(out).toContain("2026-10-13 09:00  nothing changed  0 URLs");
+    expect(out).toContain("Google does not take part");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("indexnow status exits 3 until the key file is live, and --json is the payload", async () => {
+    const server = fakeServer({
+      "GET /api/cli/v1/projects": projectsRoute,
+      [`GET /api/cli/v1/projects/${PROJECT}/indexnow`]: () => ({
+        body: indexNow({ state: "waiting", recentDeploys: [] }),
+      }),
+    });
+    const t = fakeIo({ fetch: server.fetch, cwd: cwd() });
+    await platformCommand("indexnow", ["status", "--json"], t.io);
+    expect(JSON.parse(t.stdout())).toMatchObject({ state: "waiting" });
+    expect(process.exitCode).toBe(3);
+  });
+
+  it("indexnow setup opens the pull request and waits for the deploy", async () => {
+    const server = fakeServer({
+      "GET /api/cli/v1/projects": projectsRoute,
+      [`POST /api/cli/v1/projects/${PROJECT}/indexnow/setup`]: () => ({
+        body: indexNow({
+          result: "started",
+          state: "waiting",
+          recentDeploys: [],
+        }),
+      }),
+    });
+    const t = fakeIo({ fetch: server.fetch, cwd: cwd() });
+    await platformCommand("indexnow", ["setup", "--project", PROJECT], t.io);
+    expect(server.calls.at(-1)).toMatchObject({ method: "POST", body: {} });
+    expect(t.stdout()).toContain("Opened the key file pull request");
+    expect(t.stdout()).toContain("https://github.com/acme/web/pull/9");
+    expect(process.exitCode).toBe(3);
+  });
+
+  it("indexnow setup reports a conflicting file as a failure", async () => {
+    const server = fakeServer({
+      "GET /api/cli/v1/projects": projectsRoute,
+      [`POST /api/cli/v1/projects/${PROJECT}/indexnow/setup`]: () => ({
+        body: indexNow({ result: "conflict", state: "not_started" }),
+      }),
+    });
+    const t = fakeIo({ fetch: server.fetch, cwd: cwd() });
+    await platformCommand("indexnow", ["setup"], t.io);
+    expect(t.stderr()).toContain("A different file already exists");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("indexnow on|off posts the switch; errors keep their server message", async () => {
+    const server = fakeServer({
+      "GET /api/cli/v1/projects": projectsRoute,
+      [`POST /api/cli/v1/projects/${PROJECT}/indexnow/enabled`]: (call) =>
+        (call.body as { enabled: boolean }).enabled
+          ? {
+              status: 409,
+              body: {
+                error: "unverified",
+                message:
+                  "IndexNow is not set up for this production URL yet. Set it up first.",
+              },
+            }
+          : { body: indexNow({ state: "off", enabled: false }) },
+    });
+    const t = fakeIo({ fetch: server.fetch, cwd: cwd() });
+    await platformCommand("indexnow", ["off"], t.io);
+    expect(server.calls.at(-1)?.body).toEqual({ enabled: false });
+    expect(t.stdout()).toContain("IndexNow submissions paused");
+    await expect(
+      platformCommand("indexnow", ["on"], t.io),
+    ).rejects.toMatchObject({
+      code: "unverified",
+      message: expect.stringContaining("Set it up first"),
+    });
+    await expect(platformCommand("indexnow", ["toggle"], t.io)).rejects.toThrow(
+      /Usage: paradigma indexnow/,
+    );
+  });
+
+  const coverage = (overrides: Record<string, unknown> = {}) => ({
+    projectId: PROJECT,
+    productionUrl: "https://acme.test",
+    connected: true,
+    property: "sc-domain:acme.test",
+    access: "read_only",
+    candidates: 120,
+    checked: 80,
+    indexed: 34,
+    notChecked: 40,
+    coverage: 0.425,
+    change: 5,
+    byReason: {
+      indexed: 34,
+      discovered_not_indexed: 30,
+      noindex: 16,
+      not_checked: 40,
+    },
+    lastCheckAt: "2026-10-16T08:00:00.000Z",
+    running: false,
+    budget: { daily: 200, usedToday: 80 },
+    requests: {
+      day: "2026-10-16",
+      items: [
+        {
+          url: "https://acme.test/pricing",
+          reason: "discovered_not_indexed",
+          reasonLabel: "Discovered, not indexed",
+          inspectUrl:
+            "https://search.google.com/search-console/inspect?resource_id=sc-domain%3Aacme.test&id=https%3A%2F%2Facme.test%2Fpricing",
+          requested: false,
+          requestedAt: null,
+          outcome: null,
+        },
+        {
+          url: "https://acme.test/docs",
+          reason: "discovered_not_indexed",
+          reasonLabel: "Discovered, not indexed",
+          inspectUrl: "https://search.google.com/search-console/inspect?x",
+          requested: true,
+          requestedAt: "2026-10-16T09:00:00.000Z",
+          outcome: "waiting",
+        },
+      ],
+    },
+    wins: [
+      {
+        url: "https://acme.test/blog",
+        requestedAt: "2026-10-10T09:00:00.000Z",
+        indexedAt: "2026-10-13T08:00:00.000Z",
+      },
+    ],
+    sitemap: {
+      read: true,
+      roots: ["https://acme.test/sitemap.xml"],
+      canSubmit: false,
+      submittedAt: null,
+      submitError: null,
+      report: [],
+    },
+    dashboardUrl: `${SERVER}/dashboard/sites/${PROJECT}#indexing`,
+    reconnectUrl: `${SERVER}/dashboard/sites/${PROJECT}/connect/gsc?access=sitemaps`,
+    ...overrides,
+  });
+
+  it("index shows coverage, reasons and today's links, and exits 3 while some are left", async () => {
+    const server = fakeServer({
+      "GET /api/cli/v1/projects": projectsRoute,
+      [`GET /api/cli/v1/projects/${PROJECT}/index`]: () => ({
+        body: coverage(),
+      }),
+    });
+    const t = fakeIo({ fetch: server.fetch, cwd: cwd() });
+    await platformCommand("index", [], t.io);
+    const out = t.stdout();
+    expect(out).toContain(
+      "Indexed           34 of 80 checked pages (+5 since yesterday)",
+    );
+    expect(out).toContain("Not checked yet 40 of 120 candidates");
+    expect(out).toContain("   30  Discovered, not indexed");
+    expect(out).toContain("   16  Excluded by noindex");
+    expect(out).toContain(
+      "[ ] https://acme.test/pricing  Discovered, not indexed",
+    );
+    expect(out).toContain(
+      "https://search.google.com/search-console/inspect?resource_id=sc-domain%3Aacme.test",
+    );
+    expect(out).toContain("[x] https://acme.test/docs");
+    expect(out).toContain("agent with browser access");
+    expect(out).toContain("https://acme.test/blog  2026-10-13");
+    expect(out).toContain("resubmission off (read-only Google access)");
+    expect(out).toContain("connect/gsc?access=sitemaps");
+    expect(process.exitCode).toBe(3);
+  });
+
+  it("index --json is the payload; nothing left means exit 0", async () => {
+    const done = coverage({ requests: { day: "2026-10-16", items: [] } });
+    const server = fakeServer({
+      "GET /api/cli/v1/projects": projectsRoute,
+      [`GET /api/cli/v1/projects/${PROJECT}/index`]: () => ({ body: done }),
+    });
+    const t = fakeIo({ fetch: server.fetch, cwd: cwd() });
+    await platformCommand("index", ["--json"], t.io);
+    expect(JSON.parse(t.stdout())).toMatchObject({ indexed: 34 });
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("index requested posts the URLs and reports unknown ones", async () => {
+    const server = fakeServer({
+      "GET /api/cli/v1/projects": projectsRoute,
+      [`POST /api/cli/v1/projects/${PROJECT}/index/requested`]: () => ({
+        body: {
+          projectId: PROJECT,
+          marked: ["https://acme.test/pricing"],
+          unknown: ["https://other.test/x"],
+          requests: coverage().requests,
+        },
+      }),
+    });
+    const t = fakeIo({ fetch: server.fetch, cwd: cwd() });
+    await platformCommand(
+      "index",
+      ["requested", "https://acme.test/pricing/", "https://other.test/x"],
+      t.io,
+    );
+    expect(server.calls.at(-1)?.body).toEqual({
+      urls: ["https://acme.test/pricing/", "https://other.test/x"],
+      requested: true,
+    });
+    expect(t.stdout()).toContain("Marked as requested: 1 page.");
+    expect(t.stderr()).toContain("Not one of this project's checked pages");
+    expect(process.exitCode).toBe(1);
+    await expect(platformCommand("index", ["requested"], t.io)).rejects.toThrow(
+      /1 to 20 URLs/,
+    );
+    await expect(platformCommand("index", ["submit"], t.io)).rejects.toThrow(
+      /Usage: paradigma index/,
+    );
+  });
+
+  it("index check starts the batch or says one is running", async () => {
+    const server = fakeServer({
+      "GET /api/cli/v1/projects": projectsRoute,
+      [`POST /api/cli/v1/projects/${PROJECT}/index/check`]: () => ({
+        status: 202,
+        body: {
+          projectId: PROJECT,
+          requested: true,
+          budget: { daily: 200, usedToday: 12 },
+        },
+      }),
+    });
+    const t = fakeIo({ fetch: server.fetch, cwd: cwd() });
+    await platformCommand("index", ["check"], t.io);
+    expect(server.calls.at(-1)).toMatchObject({ method: "POST", body: {} });
+    expect(t.stdout()).toContain(
+      "Checking now (12/200 inspections used today)",
+    );
+  });
+
+  it("google account validates the id and posts the choice", async () => {
+    const server = fakeServer({
+      "GET /api/cli/v1/projects": projectsRoute,
+      [`POST /api/cli/v1/projects/${PROJECT}/google/analytics-account`]:
+        () => ({
+          body: {
+            projectId: PROJECT,
+            verified: true,
+            started: true,
+            done: true,
+            startUrl: "x",
+            searchConsole: {
+              status: "connected",
+              property: "sc-domain:acme.test",
+              file: null,
+              pullUrl: null,
+            },
+            analytics: {
+              status: "created",
+              propertyId: "9",
+              measurementId: "G-XYZ999",
+              accounts: [],
+              createAccountUrl: null,
+              tagInstructions: null,
+            },
+            lastError: null,
+          },
+        }),
+    });
+    const t = fakeIo({ fetch: server.fetch, cwd: cwd() });
+    await expect(
+      platformCommand("google", ["account", "abc"], t.io),
+    ).rejects.toThrow(/Usage/);
+    await platformCommand(
+      "google",
+      ["account", "42", "--time-zone", "Europe/Berlin"],
+      t.io,
+    );
+    expect(server.calls.at(-1)?.body).toEqual({
+      accountId: "42",
+      timeZone: "Europe/Berlin",
+    });
+    expect(t.stdout()).toContain("G-XYZ999");
+    expect(process.exitCode).toBeUndefined();
   });
 
   it("sync rejects unknown sources and --json failures are parseable", async () => {
@@ -565,5 +1108,43 @@ describe("mcp install", () => {
     const broken = await installCursor(`${SERVER}/api/mcp`, home);
     expect(broken.status).toBe("failed");
     expect(readFileSync(file, "utf8")).toBe("{ not json");
+  });
+});
+
+describe("frameworkConfigUrl", () => {
+  it("reads the production URL other frameworks declare, without running them", () => {
+    expect(
+      frameworkConfigUrl(
+        "astro.config.mjs",
+        'export default defineConfig({ site: "https://acme.dev", integrations: [] })',
+      ),
+    ).toEqual({ url: "https://acme.dev", label: "astro.config site" });
+    expect(
+      frameworkConfigUrl(
+        "hugo.toml",
+        'title = "Acme"\nbaseURL = "https://acme.dev/"\n',
+      )?.url,
+    ).toBe("https://acme.dev/");
+    expect(
+      frameworkConfigUrl("hugo.yaml", "baseURL: https://docs.acme.dev\n")?.url,
+    ).toBe("https://docs.acme.dev");
+    expect(
+      frameworkConfigUrl(
+        "_config.yml",
+        'title: Blog\nurl: "https://blog.acme.dev"\n',
+      )?.url,
+    ).toBe("https://blog.acme.dev");
+    expect(
+      frameworkConfigUrl(
+        "gatsby-config.js",
+        "siteMetadata: { siteUrl: `https://acme.dev` }",
+      )?.url,
+    ).toBe("https://acme.dev");
+    expect(
+      frameworkConfigUrl("astro.config.mjs", "site: process.env.SITE"),
+    ).toBeNull();
+    expect(
+      frameworkConfigUrl("package.json", '{"homepage":"https://x"}'),
+    ).toBeNull();
   });
 });

@@ -1,6 +1,12 @@
 import { z } from "zod";
 import { normalizeServer } from "./api";
 import {
+  type AutopilotDefaultBody,
+  aiEnginesResponseSchema,
+  autopilotDefaultResponseSchema,
+  autopilotPolicyResponseSchema,
+  bingOAuthStartResponseSchema,
+  bingOAuthStatusResponseSchema,
   CLI_API_PREFIX,
   type CliVerificationMethod,
   type CreateProjectRequest,
@@ -9,6 +15,18 @@ import {
   cliProjectsResponseSchema,
   cliStatusResponseSchema,
   cliTargetsResponseSchema,
+  type GscAiImportRequest,
+  googleSetupResponseSchema,
+  gscAiImportResponseSchema,
+  gscAiStatusResponseSchema,
+  indexCheckResponseSchema,
+  indexCoverageResponseSchema,
+  indexNowStatusResponseSchema,
+  indexRequestedResponseSchema,
+  type OpenRouterStartBody,
+  openRouterStartResponseSchema,
+  openRouterStatusResponseSchema,
+  projectScanResponseSchema,
   type SyncSource,
   type UpdateProjectRequest,
   verificationInstructionsSchema,
@@ -18,6 +36,13 @@ import {
   setupExchangeResponseSchema,
 } from "./contract/setup";
 import type { FetchLike } from "./io";
+import {
+  type FinishTaskBody,
+  startTaskResponseSchema,
+  tasksPromptResponseSchema,
+  tasksResponseSchema,
+  taskWriteResponseSchema,
+} from "./tasks-api";
 
 /** Server error with its stable code (`invalid_token`, `not_found`, …). */
 export class PlatformError extends Error {
@@ -179,7 +204,7 @@ export class PlatformClient {
     return parsed.data;
   }
 
-  private path(...parts: string[]) {
+  protected path(...parts: string[]) {
     return `${CLI_API_PREFIX}/${parts.map(encodeURIComponent).join("/")}`;
   }
 
@@ -247,6 +272,125 @@ export class PlatformClient {
     );
   }
 
+  googleSetup(projectId: string) {
+    return this.request(
+      "GET",
+      this.path("projects", projectId, "google"),
+      googleSetupResponseSchema,
+    );
+  }
+
+  checkGoogleSetup(projectId: string) {
+    return this.request(
+      "POST",
+      this.path("projects", projectId, "google", "check"),
+      googleSetupResponseSchema,
+      { body: {} },
+    );
+  }
+
+  chooseGa4Account(projectId: string, accountId: string, timeZone?: string) {
+    return this.request(
+      "POST",
+      this.path("projects", projectId, "google", "analytics-account"),
+      googleSetupResponseSchema,
+      { body: { accountId, ...(timeZone ? { timeZone } : {}) } },
+    );
+  }
+
+  gscAiStatus(projectId: string) {
+    return this.request(
+      "GET",
+      this.path("projects", projectId, "gsc-ai"),
+      gscAiStatusResponseSchema,
+    );
+  }
+
+  /** The Search Console AI export as base64; the server parses it, contents never come back. */
+  importGscAi(projectId: string, input: GscAiImportRequest) {
+    return this.request(
+      "POST",
+      this.path("projects", projectId, "gsc-ai"),
+      gscAiImportResponseSchema,
+      { body: input },
+    );
+  }
+
+  indexNowStatus(projectId: string) {
+    return this.request(
+      "GET",
+      this.path("projects", projectId, "indexnow"),
+      indexNowStatusResponseSchema,
+    );
+  }
+
+  /** Opens (or reuses) the key-file pull request; the key is public by design. */
+  setupIndexNow(projectId: string) {
+    return this.request(
+      "POST",
+      this.path("projects", projectId, "indexnow", "setup"),
+      indexNowStatusResponseSchema,
+      { body: {} },
+    );
+  }
+
+  setIndexNowEnabled(projectId: string, enabled: boolean) {
+    return this.request(
+      "POST",
+      this.path("projects", projectId, "indexnow", "enabled"),
+      indexNowStatusResponseSchema,
+      { body: { enabled } },
+    );
+  }
+
+  /** Google index coverage and today's pages to request, with Search Console links. */
+  indexCoverage(projectId: string) {
+    return this.request(
+      "GET",
+      this.path("projects", projectId, "index"),
+      indexCoverageResponseSchema,
+    );
+  }
+
+  /** Marks pages as requested in Search Console (false clears the mark). */
+  markIndexRequested(projectId: string, urls: string[], requested = true) {
+    return this.request(
+      "POST",
+      this.path("projects", projectId, "index", "requested"),
+      indexRequestedResponseSchema,
+      { body: { urls, requested } },
+    );
+  }
+
+  /** Runs today's URL Inspection batch now, within the daily budget. */
+  indexCheck(projectId: string) {
+    return this.request(
+      "POST",
+      this.path("projects", projectId, "index", "check"),
+      indexCheckResponseSchema,
+      { body: {} },
+    );
+  }
+
+  /** The latest four-pillar scan: scores and the fix-first list. */
+  projectScan(projectId: string) {
+    return this.request(
+      "GET",
+      this.path("projects", projectId, "scan"),
+      projectScanResponseSchema,
+    );
+  }
+
+  /** Starts a scan unless one is in flight or too recent (`requested: false` with a reason). */
+  requestProjectScan(projectId: string) {
+    return this.request(
+      "POST",
+      this.path("projects", projectId, "scan"),
+      projectScanResponseSchema,
+      { body: {} },
+    );
+  }
+
   audit(projectId: string, idempotencyKey: string) {
     return this.request(
       "POST",
@@ -272,6 +416,50 @@ export class PlatformClient {
       this.path("projects", projectId, "credentials"),
       loose,
       { body: input },
+    );
+  }
+
+  /** Starts OpenRouter OAuth on the server; the key never comes back here. */
+  openRouterStart(input: OpenRouterStartBody) {
+    return this.request(
+      "POST",
+      this.path("ai", "openrouter"),
+      openRouterStartResponseSchema,
+      { body: input },
+    );
+  }
+
+  openRouterStatus(requestId: string) {
+    return this.request(
+      "GET",
+      this.path("ai", "openrouter", requestId),
+      openRouterStatusResponseSchema,
+    );
+  }
+
+  /** Starts "Connect Bing" on the server; tokens never come back here. */
+  bingOAuthStart(projectId: string) {
+    return this.request(
+      "POST",
+      this.path("projects", projectId, "bing", "oauth"),
+      bingOAuthStartResponseSchema,
+      { body: {} },
+    );
+  }
+
+  bingOAuthStatus(requestId: string) {
+    return this.request(
+      "GET",
+      this.path("bing", "oauth", requestId),
+      bingOAuthStatusResponseSchema,
+    );
+  }
+
+  aiEngines(projectId: string) {
+    return this.request(
+      "GET",
+      this.path("projects", projectId, "ai"),
+      aiEnginesResponseSchema,
     );
   }
 
@@ -370,8 +558,35 @@ export class PlatformClient {
     return this.request(
       "POST",
       this.path("repos", repoId, "autopilot", "policy"),
-      loose,
+      autopilotPolicyResponseSchema,
       { body: policy },
+    );
+  }
+
+  /** Current policy, workspace default and whether level 0 is allowed. */
+  autopilotPolicyRead(repoId: string) {
+    return this.request(
+      "GET",
+      this.path("repos", repoId, "autopilot", "policy"),
+      autopilotPolicyResponseSchema,
+    );
+  }
+
+  autopilotDefault(orgId: string, body: AutopilotDefaultBody) {
+    return this.request(
+      "POST",
+      this.path("orgs", orgId, "autopilot", "default"),
+      autopilotDefaultResponseSchema,
+      { body },
+    );
+  }
+
+  autopilotFollowDefault(repoId: string, confirmFullAutopilot?: boolean) {
+    return this.request(
+      "POST",
+      this.path("repos", repoId, "autopilot", "follow-default"),
+      autopilotPolicyResponseSchema,
+      { body: confirmFullAutopilot ? { confirmFullAutopilot } : {} },
     );
   }
 
@@ -390,6 +605,57 @@ export class PlatformClient {
       this.path("repos", repoId, "autopilot", "resume"),
       loose,
       { body: {} },
+    );
+  }
+
+  /** Tasks grouped by project; every project without `project`. */
+  tasks(query: { project?: string; status?: "open" | "all" } = {}) {
+    const params = new URLSearchParams();
+    if (query.project) params.set("project", query.project);
+    if (query.status) params.set("status", query.status);
+    const search = params.size ? `?${params}` : "";
+    return this.request(
+      "GET",
+      `${this.path("tasks")}${search}`,
+      tasksResponseSchema,
+    );
+  }
+
+  /** Leases a task to the agent calling (403 locked project, 409 already running). */
+  startTask(taskId: string) {
+    return this.request(
+      "POST",
+      this.path("tasks", taskId, "start"),
+      startTaskResponseSchema,
+      { body: {} },
+    );
+  }
+
+  finishTask(taskId: string, body: FinishTaskBody) {
+    return this.request(
+      "POST",
+      this.path("tasks", taskId, "finish"),
+      taskWriteResponseSchema,
+      { body },
+    );
+  }
+
+  /** Gives a started task back to the queue. */
+  releaseTask(taskId: string) {
+    return this.request(
+      "POST",
+      this.path("tasks", taskId, "release"),
+      taskWriteResponseSchema,
+      { body: {} },
+    );
+  }
+
+  /** The prompt that hands a project's open tasks to the person's own agent. */
+  tasksPrompt(projectId: string) {
+    return this.request(
+      "GET",
+      this.path("projects", projectId, "tasks", "prompt"),
+      tasksPromptResponseSchema,
     );
   }
 }

@@ -158,3 +158,27 @@ export function hostAgent(
   if (env.CURSOR_AGENT || env.CURSOR_TRACE_ID) return "cursor";
   return null;
 }
+
+/** Each MCP agent's command, to find which one is installed. */
+const MCP_AGENT_BINARIES: Record<McpAgent, string> = {
+  claude: "claude",
+  codex: "codex",
+  cursor: "cursor-agent",
+};
+
+/** The first installed agent (Claude Code, Codex, Cursor) whose command runs, else null. */
+export async function installedMcpAgent(
+  env: Record<string, string | undefined> = process.env,
+  timeoutMs = 15_000,
+): Promise<McpAgent | null> {
+  const found = await Promise.all(
+    MCP_AGENTS.map(async (agent) => {
+      const result = await run(MCP_AGENT_BINARIES[agent], ["--version"], {
+        timeoutMs,
+        env: env as NodeJS.ProcessEnv,
+      });
+      return result.code === 0 ? agent : null;
+    }),
+  );
+  return found.find((agent) => agent !== null) ?? null;
+}
