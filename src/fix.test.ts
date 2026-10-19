@@ -349,6 +349,8 @@ function harness(input: {
   taskStatus?: number;
   /** The model proxy answers this error instead of a turn. */
   proxyError?: { status: number; error: string };
+  /** The first check answers this error instead of a result. */
+  checkError?: { status: number; error: string; message: string };
 }) {
   const h: Harness = {
     requests: [],
@@ -385,6 +387,11 @@ function harness(input: {
         : json(input.task ?? task());
     if (url === `${SERVER}/api/autopilot/action/check`) {
       h.checks.push(body);
+      if (input.checkError && h.checks.length === 1)
+        return json(
+          { error: input.checkError.error, message: input.checkError.message },
+          input.checkError.status,
+        );
       const passed = input.checkPassed ? input.checkPassed(checkIndex++) : true;
       return json({
         mode: body.files ? "static" : "html",
@@ -561,6 +568,28 @@ function noContents(h: Harness) {
 }
 
 describe("runFix", () => {
+  it("answers a refused check back to the model and keeps the run going", async () => {
+    const root = await gitRepo({ "index.html": BASE_HTML });
+    const steps: ModelStep[] = [
+      FIX_STEPS[0],
+      FIX_STEPS[1],
+      { calls: [{ name: "check_html", input: { url: "nope", html: "<p>x</p>" } }] },
+      ...FIX_STEPS.slice(2),
+    ];
+    const { h, deps } = harness({
+      root,
+      steps,
+      checkError: { status: 400, error: "invalid_url", message: "The URL is not valid." },
+    });
+    const result = await runFix(deps, OPTIONS);
+    expect(result).toMatchObject({ outcome: "pr_opened" });
+    // The refusal went back to the model as the tool's result, not as a failed run.
+    const toolResults = JSON.stringify(
+      h.requests.filter((r) => r.url.includes("anthropic") || r.url.endsWith("/action/model")).map((r) => r.body),
+    );
+    expect(toolResults).toContain("The URL is not valid.");
+  });
+
   it("fixes, commits to the task branch, opens the PR and reports metadata only", async () => {
     const root = await gitRepo({ "index.html": BASE_HTML });
     const { h, deps } = harness({ root, steps: FIX_STEPS });

@@ -27,7 +27,7 @@ inputs:
   cli-version:
     description: The paradigma-cli version to run (bumped with each release of this action).
     required: false
-    default: "0.12.0"
+    default: "0.12.1"
   node-version:
     description: Node.js version for the CLI.
     required: false

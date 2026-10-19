@@ -400,6 +400,9 @@ export function fixActionWorkflow(input: { appUrl: string }): string {
     "# Paradigma starts this workflow with repository_dispatch for one task at a time.",
     "# The model comes from Paradigma: no secret is needed.",
     "name: Paradigma fix",
+    // Names each run after its task, so Paradigma can tell whether GitHub started it.
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: a GitHub Actions expression, not JavaScript.
+    "run-name: Paradigma fix ${{ github.event.client_payload.task_id }}",
     "on:",
     "  repository_dispatch:",
     `    types: [${FIX_ACTION_EVENT}]`,

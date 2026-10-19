@@ -377,6 +377,8 @@ export class FixWorkspace {
       }
     } catch (error) {
       if (error instanceof FixReportableError) throw error;
+      if (error instanceof Error && error.name === "FixToolRefused")
+        return { ok: false, error: error.message.slice(0, 400) };
       return { ok: false, error: "The tool failed." };
     }
   }

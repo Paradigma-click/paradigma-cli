@@ -93,6 +93,14 @@ export type FixRunResult = {
   reported: boolean;
 };
 
+/** Statuses that mean the tool call itself was wrong, answered back to the model. */
+const SOFT_STATUSES = new Set([400, 409, 413, 422, 429]);
+
+/** A tool call Paradigma refused; its message goes back to the model as the tool's result. */
+export class FixToolRefused extends Error {
+  override readonly name = "FixToolRefused";
+}
+
 class FixServer {
   constructor(
     private readonly fetch: FetchLike,
@@ -100,7 +108,11 @@ class FixServer {
     private readonly token: string,
   ) {}
 
-  private async call(path: string, init: RequestInit = {}): Promise<unknown> {
+  private async call(
+    path: string,
+    init: RequestInit = {},
+    soft = false,
+  ): Promise<unknown> {
     let response: Response;
     try {
       response = await this.fetch(`${this.server}${path}`, {
@@ -127,6 +139,18 @@ class FixServer {
         "token_expired",
         "This task is no longer available (the task token expired or the task moved on).",
       );
+    if (soft && SOFT_STATUSES.has(response.status)) {
+      // The tool call was wrong (a bad URL, a quota): tell the model and keep the run going.
+      const detail = (await response.json().catch(() => null)) as {
+        error?: string;
+        message?: string;
+      } | null;
+      throw new FixToolRefused(
+        detail?.message ??
+          detail?.error ??
+          `Paradigma refused this call (HTTP ${response.status}).`,
+      );
+    }
     if (!response.ok)
       throw new FixReportableError(
         "internal_error",
@@ -149,10 +173,11 @@ class FixServer {
 
   async check(body: Record<string, unknown>): Promise<ActionCheckResponse> {
     const parsed = actionCheckResponseSchema.safeParse(
-      await this.call(FIX_ACTION_PATHS.check, {
-        method: "POST",
-        body: JSON.stringify(body),
-      }),
+      await this.call(
+        FIX_ACTION_PATHS.check,
+        { method: "POST", body: JSON.stringify(body) },
+        true,
+      ),
     );
     if (!parsed.success)
       throw new FixReportableError(
