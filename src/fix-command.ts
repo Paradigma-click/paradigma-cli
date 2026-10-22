@@ -10,6 +10,7 @@ import {
   FIX_ACTION_KEY_SECRETS,
   FIX_ACTION_PATHS,
   FIX_ACTION_TOKEN_PREFIX,
+  type GiveUpReason,
   type OwnModelProvider,
 } from "./contract/fix-action";
 import { type ExecResult, run } from "./exec";
@@ -30,6 +31,7 @@ import {
   maskCommand,
   startConversation,
 } from "./fix-model";
+import { DEFAULT_ACTION_BUDGET, FixProgress } from "./fix-progress";
 import { FixReportableError, FixWorkspace } from "./fix-tools";
 import { type FetchLike, type Io, UsageError } from "./io";
 
@@ -274,6 +276,16 @@ const MODEL_MESSAGES: Record<FixModelErrorCategory, string> = {
     "This task is no longer available (the task token expired or the task moved on).",
 };
 
+/** Why the run gave up, for the job's log (docs/36 §15, 22/10/2026). */
+export const GIVE_UP_LINES: Record<GiveUpReason, string> = {
+  no_edit: "no file was changed within the task's budget.",
+  check_stalled: "the check kept failing without getting closer.",
+  unverifiable: "the check cannot judge this result without building the site.",
+  repeated_call: "the agent repeated the same call without writing anything.",
+  check_refused: "Paradigma refused the same check twice.",
+  budget: "the task's token budget is spent.",
+};
+
 /** The agent skipped and left nothing changed (a mutable read the compiler cannot narrow). */
 function skippedClean(ws: FixWorkspace): boolean {
   return ws.finished?.outcome === "skipped" && ws.changedFiles().length === 0;
@@ -310,6 +322,7 @@ export async function runFix(
   say(`Paradigma fix: ${task.title} (${task.category})`);
 
   const totals: FixTotals = { input: 0, output: 0 };
+  const progress = new FixProgress(task.budget ?? DEFAULT_ACTION_BUDGET);
   const checks: CommandCheck[] = [];
   let model: string | null = null;
   let workspace: FixWorkspace | null = null;
@@ -388,19 +401,30 @@ export async function runFix(
 
     const build = options.build ?? null;
     const test = options.test ?? null;
-    const verify = async (): Promise<{
-      ok: boolean;
-      feedback: string[];
-      reason: ActionReason;
-    }> => {
+    const verify = async (): Promise<
+      | { ok: true }
+      | {
+          ok: false;
+          feedback: string[];
+          reason: ActionReason;
+          /** The check could not judge an item statically: a retry cannot fix that. */
+          unknown: boolean;
+        }
+    > => {
       const limits = ws.checkLimits();
       if (!limits.ok)
-        return { ok: false, feedback: [limits.message], reason: "limits" };
+        return {
+          ok: false,
+          feedback: [limits.message],
+          reason: "limits",
+          unknown: false,
+        };
       if (limits.changes.length === 0)
         return {
           ok: false,
           feedback: ["Nothing changed."],
           reason: "pre_pr_failed",
+          unknown: false,
         };
       for (const [name, command] of [
         ["build", build],
@@ -418,19 +442,38 @@ export async function runFix(
               `The ${name} command ${check.status === "timeout" ? "timed out" : "failed"}. Make sure the edit keeps the project building and its tests passing.`,
             ],
             reason: "build_failed",
+            unknown: false,
           };
         }
       }
       // A build or formatter must never change what gets committed.
       await ws.restoreWritten();
-      const check = await server.check({
-        files: ws.changedFiles(),
-        final: true,
-      });
-      return check.passed
-        ? { ok: true, feedback: [], reason: "pre_pr_failed" }
-        : { ok: false, feedback: feedbackOf(check), reason: "pre_pr_failed" };
+      let check: ActionCheckResponse;
+      try {
+        check = await server.check({ files: ws.changedFiles(), final: true });
+      } catch (error) {
+        // A refused final check (a bad request, the check quota) is a failed check, not a crash.
+        if (!(error instanceof FixToolRefused)) throw error;
+        return {
+          ok: false,
+          feedback: [error.message.slice(0, 400)],
+          reason: "pre_pr_failed",
+          unknown: false,
+        };
+      }
+      if (check.passed) return { ok: true };
+      return {
+        ok: false,
+        feedback: feedbackOf(check),
+        reason: "pre_pr_failed",
+        unknown: check.results.some((result) => result.status === "unknown"),
+      };
     };
+    const giveUp = (why: GiveUpReason) => {
+      say(`Gave up: ${GIVE_UP_LINES[why]}`);
+      return finish("skipped", "gave_up", { gaveUp: why });
+    };
+    const changed = () => ws.changedFiles().length > 0;
 
     if (task.needsBuild && !build && !test)
       say(
@@ -443,11 +486,31 @@ export async function runFix(
       workspace: ws,
       caps: task.caps,
       totals,
+      progress,
       onTool,
     });
     if (skippedClean(ws)) return await finish("skipped", "agent_skipped");
+    // Nothing written: a second attempt would only explore again (docs/36 §15, 22/10/2026).
+    if (!changed()) {
+      if (attempt.stop === "model" && attempt.modelError)
+        throw new FixModelError(attempt.modelError);
+      if (attempt.stop === "tokens" || attempt.stop === "turns")
+        return await finish("failed", "caps");
+      return await giveUp(attempt.gaveUp ?? "no_edit");
+    }
     let verdict = await verify();
     if (!verdict.ok && ws.finished?.outcome !== "skipped") {
+      // Whatever stopped the first attempt also rules out a second one.
+      if (attempt.stop === "model" && attempt.modelError)
+        throw new FixModelError(attempt.modelError);
+      const why =
+        attempt.gaveUp ??
+        (verdict.unknown ? "unverifiable" : progress.stop(totals));
+      // A failed build or a limit says more than the give-up: it stays the reason.
+      if (why)
+        return verdict.reason === "pre_pr_failed"
+          ? await giveUp(why)
+          : await finish("failed", verdict.reason);
       say("The check failed; one more attempt.");
       ws.finished = null;
       const retry = task.retryPrompt.replace(
@@ -459,15 +522,19 @@ export async function runFix(
         workspace: ws,
         caps: task.caps,
         totals,
+        progress,
         onTool,
       });
       if (skippedClean(ws)) return await finish("skipped", "agent_skipped");
       verdict = await verify();
+      if (!verdict.ok && attempt.stop === "model" && attempt.modelError)
+        throw new FixModelError(attempt.modelError);
+      if (!verdict.ok && attempt.gaveUp && verdict.reason === "pre_pr_failed")
+        return await giveUp(attempt.gaveUp);
     }
     if (!verdict.ok) {
       const capped =
-        ws.changedFiles().length === 0 &&
-        (attempt.stop === "tokens" || attempt.stop === "turns");
+        !changed() && (attempt.stop === "tokens" || attempt.stop === "turns");
       say(`Not fixed: ${verdict.feedback[0] ?? "the check failed"}`);
       return await finish("failed", capped ? "caps" : verdict.reason);
     }

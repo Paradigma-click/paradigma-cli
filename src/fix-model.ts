@@ -4,6 +4,8 @@ import {
   type ActionTool,
   actionModelResponseSchema,
   FIX_ACTION_PATHS,
+  GIVE_UP_REASONS,
+  type GiveUpReason,
   type OwnModelProvider,
 } from "./contract/fix-action";
 import type { FetchLike } from "./io";
@@ -54,7 +56,11 @@ export type FixModelErrorCategory =
   | "token_expired";
 
 export class FixModelError extends Error {
-  constructor(readonly category: FixModelErrorCategory) {
+  constructor(
+    readonly category: FixModelErrorCategory,
+    /** With `caps`: the task's budget refused the turn, and which rule (docs/36 §15). */
+    readonly budget?: GiveUpReason,
+  ) {
     super(`Model call failed: ${category}`);
     this.name = "FixModelError";
   }
@@ -423,12 +429,23 @@ class ParadigmaConversation implements FixConversation {
         };
       }
       let code: unknown = null;
+      let budget: unknown = null;
       try {
-        code = ((await response.json()) as { error?: unknown }).error;
+        ({ error: code, budget } = (await response.json()) as {
+          error?: unknown;
+          budget?: unknown;
+        });
       } catch {
         code = null;
       }
       last = proxyErrorCategory(response.status, code);
+      if (last === "caps")
+        throw new FixModelError(
+          "caps",
+          (GIVE_UP_REASONS as readonly unknown[]).includes(budget)
+            ? (budget as GiveUpReason)
+            : undefined,
+        );
       if (last !== "rate_limited" && last !== "provider_error") break;
       if (response.status < 500 && response.status !== 429) break;
     }

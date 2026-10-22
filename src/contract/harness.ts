@@ -42,11 +42,26 @@ export const HARNESS_V1_CATEGORIES = [
 export type HarnessV1Category = (typeof HARNESS_V1_CATEGORIES)[number];
 
 /**
- * Every category the harness has playbooks for: the v1 set plus penalty risk cleanup (docs/35,
- * phase 7), whose pull requests open as drafts and never auto-merge.
+ * Categories added after the v1 evals passed (docs/36 phase 6): internal links, images and
+ * routes. Only the findings the static check can judge run hosted; the rest need a build and go
+ * to the GitHub Action.
+ */
+export const HARNESS_V2_CATEGORIES = ["links", "images", "routes"] as const;
+export type HarnessV2Category = (typeof HARNESS_V2_CATEGORIES)[number];
+
+/** Categories with one playbook per framework: v1 and phase 6. */
+export const HARNESS_FIX_CATEGORIES = [
+  ...HARNESS_V1_CATEGORIES,
+  ...HARNESS_V2_CATEGORIES,
+] as const;
+export type HarnessFixCategory = (typeof HARNESS_FIX_CATEGORIES)[number];
+
+/**
+ * Every category the harness has playbooks for: the v1 set, the phase 6 set and penalty risk
+ * cleanup (docs/35, phase 7), whose pull requests open as drafts and never auto-merge.
  */
 export const HARNESS_CATEGORIES = [
-  ...HARNESS_V1_CATEGORIES,
+  ...HARNESS_FIX_CATEGORIES,
   "policy_cleanup",
 ] as const;
 export type HarnessCategory = (typeof HARNESS_CATEGORIES)[number];

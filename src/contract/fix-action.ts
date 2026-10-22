@@ -139,6 +139,52 @@ export const actionCapsSchema = z.object({
 export type ActionCaps = z.infer<typeof actionCapsSchema>;
 
 /**
+ * Why the agent gave up on a task before the caps (docs/36 §15, 22/10/2026). Categories only:
+ * - `no_edit`: no accepted write within the edit window (turns or input tokens);
+ * - `check_stalled`: check_html failed again without fewer problems, twice in a row;
+ * - `unverifiable`: check_html answered unknown twice for one acceptance item, or the first
+ *   final check had an unknown item (the result needs the built site to be judged);
+ * - `repeated_call`: the same read, search or listing three times with no write between;
+ * - `check_refused`: Paradigma refused the same check_html call twice;
+ * - `budget`: the task's input budget is spent.
+ */
+export const GIVE_UP_REASONS = [
+  "no_edit",
+  "check_stalled",
+  "unverifiable",
+  "repeated_call",
+  "check_refused",
+  "budget",
+] as const;
+export type GiveUpReason = (typeof GIVE_UP_REASONS)[number];
+
+/**
+ * The task's budget, well below the caps (docs/36 §15, 22/10/2026). The CLI gives up once it is
+ * spent; the model proxy enforces the same numbers on the server, so an older CLI cannot burn
+ * the full caps either. Absent from older servers: the CLI uses its defaults.
+ */
+export const actionBudgetSchema = z.object({
+  /** Input tokens over the whole run (both attempts). */
+  inputTokens: z.number().int().positive(),
+  /** Input tokens the run may use before its first accepted write. */
+  editByInputTokens: z.number().int().positive(),
+  /** Model turns the run may take before its first accepted write. */
+  editByTurn: z.number().int().min(1).max(100),
+});
+export type ActionBudget = z.infer<typeof actionBudgetSchema>;
+
+/**
+ * The default budget (the server's, and the CLI's when an older server sends none): give up past
+ * 100k input tokens (two thirds of the 150k cap), or before any accepted write past 60k or 8
+ * turns. Why these numbers: docs/36 §15, 22/10/2026.
+ */
+export const DEFAULT_ACTION_BUDGET: ActionBudget = {
+  inputTokens: 100_000,
+  editByInputTokens: 60_000,
+  editByTurn: 8,
+};
+
+/**
  * `GET /api/autopilot/action/task`: everything the Action needs for one task. Fetching it marks
  * the task running.
  */
@@ -178,6 +224,8 @@ export const actionTaskResponseSchema = z.object({
   brief: taskBriefSchema,
   tools: z.array(actionToolSchema).min(1).max(10),
   caps: actionCapsSchema,
+  /** The task's budget below the caps; absent from servers older than 22/10/2026. */
+  budget: actionBudgetSchema.optional(),
   /** Model ids per provider for this category (used with the customer's own key). */
   models: z.object({
     anthropic: z.string().min(1).max(100),
@@ -303,7 +351,8 @@ export type ActionModelResponse = z.infer<typeof actionModelResponseSchema>;
 
 /**
  * Error codes of the model proxy (JSON `{ error }`): `caps` (429, the run's token or turn cap is
- * spent), `rate_limited` (429), `provider_unavailable` or `timeout` (502), `model_unavailable`
+ * spent; with `budget` set to a `GIVE_UP_REASONS` value when the task's budget below the caps
+ * refused the turn, so older CLIs still read it as a spent cap), `rate_limited` (429), `provider_unavailable` or `timeout` (502), `model_unavailable`
  * (503, no hosted provider), `own_model` (409, this run uses the customer's own key).
  */
 export const ACTION_MODEL_ERRORS = [
@@ -332,6 +381,8 @@ export const ACTION_REASONS = [
   "pr_permission",
   "token_expired",
   "caps",
+  /** The agent gave up before the caps; `gaveUp` says why. */
+  "gave_up",
   "internal_error",
 ] as const;
 export type ActionReason = (typeof ACTION_REASONS)[number];
@@ -340,6 +391,8 @@ export type ActionReason = (typeof ACTION_REASONS)[number];
 export const actionReportRequestSchema = z.object({
   outcome: z.enum(["pr_opened", "skipped", "failed"]),
   reason: z.enum(ACTION_REASONS).nullable(),
+  /** With reason `gave_up`: why the agent stopped early. */
+  gaveUp: z.enum(GIVE_UP_REASONS).nullable().optional(),
   /** The agent's own finish_task, when it called it. */
   agentOutcome: z.enum(FINISH_OUTCOMES).nullable().optional(),
   prUrl: z.url().max(500).nullable().optional(),

@@ -347,8 +347,15 @@ function harness(input: {
   prStatus?: number;
   buildCode?: number;
   taskStatus?: number;
-  /** The model proxy answers this error instead of a turn. */
-  proxyError?: { status: number; error: string };
+  /** The model proxy answers this error instead of a turn (from its `from`th request on). */
+  proxyError?: {
+    status: number;
+    error: string;
+    budget?: string;
+    from?: number;
+  };
+  /** The status of a failing check's item (default `fail`). */
+  failStatus?: "fail" | "unknown";
   /** The first check answers this error instead of a result. */
   checkError?: { status: number; error: string; message: string };
 }) {
@@ -363,6 +370,7 @@ function harness(input: {
   };
   let step = 0;
   let checkIndex = 0;
+  let proxied = 0;
   const json = (body: unknown, status = 200) =>
     new Response(JSON.stringify(body), {
       status,
@@ -399,7 +407,7 @@ function harness(input: {
         results: [
           {
             id: "metadata.description",
-            status: passed ? "pass" : "fail",
+            status: passed ? "pass" : (input.failStatus ?? "fail"),
             checks: "Description",
             summary: passed ? "Present" : "Missing",
             evidence: [],
@@ -413,8 +421,16 @@ function harness(input: {
       return json({ ok: true });
     }
     if (url === `${SERVER}/api/autopilot/action/model`) {
-      if (input.proxyError)
-        return json({ error: input.proxyError.error }, input.proxyError.status);
+      if (input.proxyError && proxied++ >= (input.proxyError.from ?? 0))
+        return json(
+          {
+            error: input.proxyError.error,
+            ...(input.proxyError.budget
+              ? { budget: input.proxyError.budget }
+              : {}),
+          },
+          input.proxyError.status,
+        );
       const current = input.steps[step++] ?? { calls: [] };
       return json({
         model: "anthropic/claude-sonnet-5.5",
@@ -573,19 +589,31 @@ describe("runFix", () => {
     const steps: ModelStep[] = [
       FIX_STEPS[0],
       FIX_STEPS[1],
-      { calls: [{ name: "check_html", input: { url: "nope", html: "<p>x</p>" } }] },
+      {
+        calls: [
+          { name: "check_html", input: { url: "nope", html: "<p>x</p>" } },
+        ],
+      },
       ...FIX_STEPS.slice(2),
     ];
     const { h, deps } = harness({
       root,
       steps,
-      checkError: { status: 400, error: "invalid_url", message: "The URL is not valid." },
+      checkError: {
+        status: 400,
+        error: "invalid_url",
+        message: "The URL is not valid.",
+      },
     });
     const result = await runFix(deps, OPTIONS);
     expect(result).toMatchObject({ outcome: "pr_opened" });
     // The refusal went back to the model as the tool's result, not as a failed run.
     const toolResults = JSON.stringify(
-      h.requests.filter((r) => r.url.includes("anthropic") || r.url.endsWith("/action/model")).map((r) => r.body),
+      h.requests
+        .filter(
+          (r) => r.url.includes("anthropic") || r.url.endsWith("/action/model"),
+        )
+        .map((r) => r.body),
     );
     expect(toolResults).toContain("The URL is not valid.");
   });
@@ -791,6 +819,137 @@ describe("runFix", () => {
     });
   });
 
+  it("gives up without a second attempt when nothing was written within the budget", async () => {
+    const root = await gitRepo({
+      "index.html": BASE_HTML,
+      "a.html": "a",
+      "b.html": "b",
+    });
+    const reads = ["index.html", "a.html", "b.html", "index.html", "a.html"];
+    const { h, deps } = harness({
+      root,
+      steps: reads.map((path) => ({
+        calls: [{ name: "read_file", input: { path } }],
+      })),
+      task: task({
+        budget: {
+          inputTokens: 100_000,
+          editByInputTokens: 2_500,
+          editByTurn: 8,
+        },
+      }),
+    });
+    const result = await runFix(deps, OPTIONS);
+    expect(result).toMatchObject({ outcome: "skipped", reason: "gave_up" });
+    // Three turns of 1,000 input tokens cross the 2,500 edit window: the fourth never goes out.
+    expect(h.requests.filter((r) => r.url.includes("anthropic"))).toHaveLength(
+      3,
+    );
+    expect(h.checks).toHaveLength(0);
+    expect(h.reports[0]).toMatchObject({
+      outcome: "skipped",
+      reason: "gave_up",
+      gaveUp: "no_edit",
+      changedPaths: [],
+    });
+    expect(h.stdout.join("")).toContain("Gave up: no file was changed");
+  });
+
+  it("gives up on the same read three times in a row", async () => {
+    const root = await gitRepo({ "index.html": BASE_HTML });
+    const { h, deps } = harness({
+      root,
+      steps: [FIX_STEPS[0], FIX_STEPS[0], FIX_STEPS[0], FIX_STEPS[1]],
+    });
+    expect(await runFix(deps, OPTIONS)).toMatchObject({
+      outcome: "skipped",
+      reason: "gave_up",
+    });
+    expect(h.reports[0]).toMatchObject({ gaveUp: "repeated_call" });
+    expect(h.requests.filter((r) => r.url.includes("anthropic"))).toHaveLength(
+      3,
+    );
+  });
+
+  it("gives up after two check_html answers that do not get closer", async () => {
+    const root = await gitRepo({ "index.html": BASE_HTML });
+    const check = { calls: [{ name: "check_html", input: {} }] };
+    const { h, deps } = harness({
+      root,
+      steps: [FIX_STEPS[0], FIX_STEPS[1], check, check, check, FIX_STEPS[3]],
+      checkPassed: () => false,
+    });
+    expect(await runFix(deps, OPTIONS)).toMatchObject({
+      outcome: "skipped",
+      reason: "gave_up",
+    });
+    expect(h.reports[0]).toMatchObject({
+      gaveUp: "check_stalled",
+      changedPaths: ["index.html"],
+    });
+    // Three agent checks and the final one; no second attempt.
+    expect(h.checks).toHaveLength(4);
+    expect(h.execs.some((e) => e.args.includes("commit"))).toBe(false);
+  });
+
+  it("ships an edit that passes the final check even after giving up", async () => {
+    const root = await gitRepo({ "index.html": BASE_HTML });
+    const check = { calls: [{ name: "check_html", input: {} }] };
+    const { h, deps } = harness({
+      root,
+      steps: [FIX_STEPS[0], FIX_STEPS[1], check, check, check],
+      // The agent's three checks fail; the final one passes.
+      checkPassed: (index) => index === 3,
+    });
+    expect(await runFix(deps, OPTIONS)).toMatchObject({ outcome: "pr_opened" });
+    expect(h.reports[0]).toMatchObject({ outcome: "pr_opened", reason: null });
+  });
+
+  it("gives up instead of retrying when the final check cannot judge the result", async () => {
+    const root = await gitRepo({ "index.html": BASE_HTML });
+    const { h, deps } = harness({
+      root,
+      steps: [FIX_STEPS[0], FIX_STEPS[1], FIX_STEPS[3]],
+      checkPassed: () => false,
+      failStatus: "unknown",
+    });
+    expect(await runFix(deps, OPTIONS)).toMatchObject({
+      outcome: "skipped",
+      reason: "gave_up",
+    });
+    expect(h.reports[0]).toMatchObject({ gaveUp: "unverifiable" });
+    expect(h.requests.filter((r) => r.url.includes("anthropic"))).toHaveLength(
+      3,
+    );
+  });
+
+  it("treats a refused final check as a failed check, not a crash", async () => {
+    const root = await gitRepo({ "index.html": BASE_HTML });
+    const { h, deps } = harness({
+      root,
+      steps: [FIX_STEPS[0], FIX_STEPS[1], FIX_STEPS[3], FIX_STEPS[3]],
+      checkError: {
+        status: 400,
+        error: "invalid_request",
+        message: "Bad files.",
+      },
+      checkPassed: () => false,
+    });
+    expect(await runFix(deps, OPTIONS)).toMatchObject({
+      outcome: "failed",
+      reason: "pre_pr_failed",
+    });
+    expect(h.reports[0]).toMatchObject({ reason: "pre_pr_failed" });
+    // The refusal's message went into the second attempt's feedback.
+    const prompts = h.requests
+      .filter((r) => r.url.includes("anthropic"))
+      .map(
+        (r) =>
+          (r.body as { messages: { content: unknown }[] }).messages[0].content,
+      );
+    expect(String(prompts.at(-1))).toContain("- Bad files.");
+  });
+
   it("refuses to run in another repository than the task's", async () => {
     const root = await gitRepo({ "index.html": BASE_HTML });
     const { h, deps } = harness({
@@ -879,11 +1038,63 @@ describe("runFix with the Paradigma model", () => {
       outcome: "failed",
       reason: "caps",
     });
-    // A spent cap is not retried.
+    // A spent cap is not retried, and with nothing written there is no second attempt.
     expect(
       h.requests.filter((r) => r.url.endsWith("/action/model")),
-    ).toHaveLength(2);
+    ).toHaveLength(1);
     expect(h.reports[0]).toMatchObject({ reason: "caps" });
+  });
+
+  it("gives up with the rule the server's budget names", async () => {
+    const root = await gitRepo({ "index.html": BASE_HTML });
+    const { h, deps } = harness({
+      root,
+      steps: [FIX_STEPS[0], FIX_STEPS[0]],
+      task: PARADIGMA,
+      proxyError: { status: 429, error: "caps", budget: "no_edit", from: 2 },
+    });
+    expect(await runFix(deps, OPTIONS)).toMatchObject({
+      outcome: "skipped",
+      reason: "gave_up",
+    });
+    expect(h.reports[0]).toMatchObject({
+      outcome: "skipped",
+      reason: "gave_up",
+      gaveUp: "no_edit",
+    });
+    expect(
+      h.requests.filter((r) => r.url.endsWith("/action/model")),
+    ).toHaveLength(3);
+  });
+
+  it("still checks and ships what was written when the model fails mid-run", async () => {
+    const root = await gitRepo({ "index.html": BASE_HTML });
+    const { h, deps } = harness({
+      root,
+      steps: FIX_STEPS,
+      task: PARADIGMA,
+      proxyError: { status: 502, error: "model_error", from: 2 },
+    });
+    const result = await runFix(deps, OPTIONS);
+    expect(result.outcome).toBe("pr_opened");
+    expect(h.checks.at(-1)).toMatchObject({ final: true });
+  });
+
+  it("reports the provider failure when what was written does not pass", async () => {
+    const root = await gitRepo({ "index.html": BASE_HTML });
+    const { h, deps } = harness({
+      root,
+      steps: FIX_STEPS,
+      task: PARADIGMA,
+      checkPassed: () => false,
+      proxyError: { status: 502, error: "model_error", from: 2 },
+    });
+    expect(await runFix(deps, OPTIONS)).toMatchObject({
+      outcome: "failed",
+      reason: "provider_error",
+    });
+    // No second attempt against a failing provider.
+    expect(h.checks).toHaveLength(1);
   });
 
   it("reports model_unavailable when the Paradigma model is down", async () => {
